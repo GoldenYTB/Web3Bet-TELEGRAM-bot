@@ -1,0 +1,55 @@
+services:
+  - type: web
+    name: gaming-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt && alembic upgrade head
+    startCommand: python main.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.0"
+      - key: PORT
+        value: "8080"
+      - key: HEALTH_HOST
+        value: "0.0.0.0"
+      - key: LOG_LEVEL
+        value: "INFO"
+      - key: DROP_PENDING_UPDATES
+        value: "true"
+      - key: DB_POOL_SIZE
+        value: "3"
+      - key: DB_MAX_OVERFLOW
+        value: "2"
+      - key: DB_POOL_TIMEOUT
+        value: "30"
+      - key: DB_ECHO
+        value: "false"
+      - key: MATCHMAKING_TTL
+        value: "300"
+      - key: HOUSE_FEE_PCT
+        value: "0.05"
+      - key: MIN_WAGER
+        value: "1"
+      - key: MAX_WAGER
+        value: "10000"
+      - key: WITHDRAWAL_FIXED_FEE
+        value: "0.10"
+      - key: WITHDRAWAL_PCT_FEE
+        value: "0.03"
+      # Set these in the Render dashboard — never put real secrets here
+      - key: BOT_TOKEN
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: WALLET_MASTER_KEY
+        sync: false
+      - key: ETH_RPC_URL
+        sync: false
+      - key: BSC_RPC_URL
+        sync: false
+      - key: POLYGON_RPC_URL
+        sync: false
+      - key: SOLANA_RPC_URL
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+    healthCheckPath: /health
