@@ -1,30 +1,39 @@
 import asyncio
 import os
 import sys
+import ssl
 from logging.config import fileConfig
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 from sqlalchemy import pool
 from sqlalchemy.engine import Connection
-from sqlalchemy.ext.asyncio import async_engine_from_config
+from sqlalchemy.ext.asyncio import create_async_engine
 from alembic import context
 
-# Make sure the gaming_bot package is importable
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from gaming_bot.models import Base
 
 config = context.config
 
-# Read DATABASE_URL from environment — never hardcode it here
+# Get URL and clean it up for asyncpg
 database_url = os.environ.get("DATABASE_URL", "")
 
-# Neon gives postgresql:// but asyncpg needs postgresql+asyncpg://
+# Fix scheme
 if database_url.startswith("postgres://"):
     database_url = database_url.replace("postgres://", "postgresql+asyncpg://", 1)
 elif database_url.startswith("postgresql://") and "+asyncpg" not in database_url:
     database_url = database_url.replace("postgresql://", "postgresql+asyncpg://", 1)
 
-config.set_main_option("sqlalchemy.url", database_url)
+# Strip sslmode and ssl query params — asyncpg handles SSL via connect_args
+parsed = urlparse(database_url)
+params = parse_qs(parsed.query)
+params.pop("sslmode", None)
+params.pop("ssl", None)
+clean_query = urlencode({k: v[0] for k, v in params.items()})
+clean_url = urlunparse(parsed._replace(query=clean_query))
+
+config.set_main_option("sqlalchemy.url", clean_url)
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
@@ -33,9 +42,8 @@ target_metadata = Base.metadata
 
 
 def run_migrations_offline() -> None:
-    url = config.get_main_option("sqlalchemy.url")
     context.configure(
-        url=url,
+        url=clean_url,
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
@@ -51,14 +59,15 @@ def do_run_migrations(connection: Connection) -> None:
 
 
 async def run_async_migrations() -> None:
-    connectable = async_engine_from_config(
-        config.get_section(config.config_ini_section, {}),
-        prefix="sqlalchemy.",
+    ssl_ctx = ssl.create_default_context()
+    engine = create_async_engine(
+        clean_url,
         poolclass=pool.NullPool,
+        connect_args={"ssl": ssl_ctx},
     )
-    async with connectable.connect() as connection:
+    async with engine.connect() as connection:
         await connection.run_sync(do_run_migrations)
-    await connectable.dispose()
+    await engine.dispose()
 
 
 def run_migrations_online() -> None:
