@@ -86,6 +86,10 @@ from gaming_bot.wallet import WalletManager
 from gaming_bot.blockchain import BlockchainMonitor
 from gaming_bot import swap as swap_module
 
+def _str(key: str, default: str = "") -> str:
+    return os.environ.get(key, default).strip()
+
+
 logger = logging.getLogger("main")
 
 
@@ -137,7 +141,12 @@ async def _post_init(app: Application) -> None:
         app.bot_data["wallet_manager"] = None
 
     # ── Blockchain monitor (deposit detection) ─────────────────────────────────
-    monitor = BlockchainMonitor(callback=_on_deposit(app))
+    api_keys = {
+        "blockcypher": cfg.blockcypher_api_key,
+        "trongrid":    cfg.trongrid_api_key,
+        "toncenter":   cfg.toncenter_api_key,
+    }
+    monitor = BlockchainMonitor(on_deposit=_on_deposit(app), api_keys=api_keys)
     try:
         await monitor.start()
         app.bot_data["monitor"] = monitor
@@ -203,63 +212,73 @@ async def _post_shutdown(app: Application) -> None:
 def _on_deposit(app: Application):
     """
     Returns an async callback invoked by BlockchainMonitor on every deposit event.
-    On confirmation, credits the user's DB balance via TransactionManager and
-    sends a Telegram notification.
+    On confirmation, credits the user USD balance and sends Telegram notification.
     """
     async def _handler(event) -> None:
         if not event.confirmed:
-            return   # only act on final confirmation
+            return
 
         log = logging.getLogger("deposit")
-        log.info(
-            "CONFIRMED deposit: %s %s → %s (label=%s) tx=%s",
-            event.amount, event.token_symbol,
-            event.address, event.label, event.tx_hash[:16],
-        )
+        log.info("CONFIRMED deposit: user=%d %s %s tx=%s",
+                 event.user_id, event.amount, event.coin_symbol, event.tx_hash[:16])
 
-        # Credit balance in database
-        tm: Optional[TransactionManager] = app.bot_data.get("tm")
-        if tm and event.label:
+        store = app.bot_data.get("store")
+        if not store:
+            return
+
+        user = store.get_user(event.user_id)
+        if not user:
+            log.warning("Deposit for unknown user %d", event.user_id)
+            return
+
+        # Get USD value of this deposit
+        monitor = app.bot_data.get("monitor")
+        usd_value = None
+        if monitor and event.usd_value:
+            usd_value = event.usd_value
+        elif monitor:
             try:
-                # label format: "user:<telegram_id>"
-                user_id = int(event.label.split(":")[-1])
-                async with tm.transaction() as session:
-                    await tm.credit_deposit(
-                        session,
-                        user_id      = user_id,
-                        network      = event.network,
-                        token_symbol = event.token_symbol,
-                        amount       = event.amount,
-                        tx_hash      = event.tx_hash,
-                        note         = f"Confirmed after {event.confirmations} blocks",
-                    )
+                usd_value = await monitor.price_feed.coin_to_usd(
+                    event.coin_symbol, event.amount)
+            except Exception:
+                pass
 
-                # Also update in-memory store for immediate display
-                store: Optional[Store] = app.bot_data.get("store")
-                if store:
-                    user = store.get_user(user_id)
-                    if user:
-                        user.add_balance(
-                            event.network.upper(),
-                            event.token_symbol,
-                            event.amount,
-                        )
+        if not usd_value or usd_value <= 0:
+            # Fallback: use swap module price feed
+            pf = swap_module.price_feed
+            if pf:
+                try:
+                    usd_value = await pf.coin_to_usd(event.coin_symbol, event.amount)
+                except Exception:
+                    pass
 
-                # Notify user in Telegram
-                usd_str = f" (~${event.usd_value:.2f})" if event.usd_value else ""
-                await app.bot.send_message(
-                    chat_id   = user_id,
-                    text      = (
-                        f"✅ *Deposit confirmed!*\n\n"
-                        f"Amount : {event.amount} {event.token_symbol}{usd_str}\n"
-                        f"Network: {event.network}\n"
-                        f"Tx     : `{event.tx_hash[:20]}…`\n"
-                        f"Blocks : {event.confirmations}"
-                    ),
-                    parse_mode = "Markdown",
-                )
-            except Exception as exc:
-                log.error("Failed to process confirmed deposit: %s", exc, exc_info=True)
+        if not usd_value or usd_value <= 0:
+            log.warning("Could not get USD price for %s — deposit not credited", event.coin_symbol)
+            return
+
+        # Credit USD balance
+        from decimal import Decimal
+        user.credit_usd(usd_value)
+        user.add_coin_holding(event.coin_symbol, event.amount)
+
+        log.info("Credited user %d +$%s USD (%s %s)",
+                 event.user_id, usd_value, event.amount, event.coin_symbol)
+
+        # Notify user
+        try:
+            await app.bot.send_message(
+                chat_id    = event.user_id,
+                parse_mode = "Markdown",
+                text       = (
+                    f"✅ *Deposit confirmed!*\n\n"
+                    f"Amount: *{event.amount} {event.coin_symbol}*\n"
+                    f"Credited: *${usd_value:.2f} USD*\n"
+                    f"New balance: *${user.usd_balance:.2f}*\n\n"
+                    f"Tx: `{event.tx_hash[:20]}...`"
+                ),
+            )
+        except Exception as exc:
+            log.warning("Could not notify user %d: %s", event.user_id, exc)
 
     return _handler
 

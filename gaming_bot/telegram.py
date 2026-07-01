@@ -568,6 +568,17 @@ async def _do_deposit(
             u.deposit_addresses[addr_key] = address
             u.deposit_keys[addr_key]      = enc_key
 
+            # Register with blockchain monitor for automatic deposit detection
+            monitor = ctx.application.bot_data.get("monitor")
+            if monitor:
+                from .blockchain import WatchedAddress
+                monitor.add_address(WatchedAddress(
+                    user_id=u.telegram_id,
+                    address=address,
+                    network=network,
+                    coin_symbol=sym,
+                ))
+
         except Exception as exc:
             logger.error("Wallet gen %s/%s failed: %s", sym, network, exc)
             await _edit(update,

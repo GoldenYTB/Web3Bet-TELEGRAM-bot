@@ -1,24 +1,19 @@
 """
-blockchain.py — Blockchain monitoring: deposit detection, confirmations, price feeds.
+blockchain.py — Deposit monitoring for all 15 coins across all networks.
 
-Merges blockchain_client.py + price feed into one module.
+Monitors:
+  EVM (ETH/BSC/Polygon) — Alchemy RPC, polls latest blocks
+  Solana                 — public RPC, polls signatures
+  BTC/LTC/DOGE/BCH      — BlockCypher webhook + polling
+  TRX/USDT TRC-20       — TronGrid API polling
+  TON                    — TONCenter API polling
+  XMR                    — manual credit only (private chain)
 
-Classes
--------
-  EVMConnection      — Single EVM RPC wrapper with reconnect
-  SolanaConnection   — Solana RPC wrapper with reconnect
-  PriceFeed          — CoinGecko price cache (no API key needed)
-  BlockchainMonitor  — Orchestrates deposit monitoring across all chains
-
-Usage
------
-    async def on_deposit(event: DepositEvent) -> None:
-        if event.confirmed:
-            await credit_user(event.address, event.amount, event.token_symbol)
-
-    async with BlockchainMonitor(callback=on_deposit) as monitor:
-        monitor.watch("ethereum", "0xUserWallet", label="user:42")
-        await asyncio.Event().wait()   # run forever
+On confirmed deposit:
+  1. Fetch USD price via CoinGecko
+  2. Credit user.usd_balance
+  3. Track coin holding in user.coin_holdings
+  4. Send Telegram notification to user
 """
 from __future__ import annotations
 
@@ -30,612 +25,647 @@ from decimal import Decimal
 from typing import Callable, Dict, List, Optional, Set
 
 import aiohttp
-from solana.rpc.async_api import AsyncClient as SolanaClient
-from solana.rpc.commitment import Confirmed as SolanaConfirmed
-from solders.pubkey import Pubkey
-from solders.signature import Signature as SolSignature
-from web3 import AsyncWeb3
-from web3.exceptions import TransactionNotFound
-from web3.middleware import ExtraDataToPOAMiddleware
 
 from .config import cfg
 
 logger = logging.getLogger(__name__)
 
-# ── Constants ─────────────────────────────────────────────────────────────────
-
-ERC20_TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
-ERC20_ABI_MINIMAL = [
-    {"name": "decimals",  "type": "function", "inputs": [], "outputs": [{"name":"","type":"uint8"}], "stateMutability":"view"},
-    {"name": "balanceOf", "type": "function",
-     "inputs": [{"name":"account","type":"address"}], "outputs":[{"name":"","type":"uint256"}], "stateMutability":"view"},
-]
-
-REQUIRED_CONFIRMATIONS: Dict[str, int] = {"ethereum": 12, "bsc": 15, "polygon": 128, "solana": 31}
-COINGECKO_IDS: Dict[str, str] = {
-    "ETH": "ethereum", "BNB": "binancecoin", "MATIC": "matic-network",
-    "SOL": "solana", "USDT": "tether", "USDC": "usd-coin",
+# ── Confirmation requirements ──────────────────────────────────────────────────
+CONFIRMATIONS = {
+    "ethereum":    12,
+    "bsc":         15,
+    "polygon":     128,
+    "solana":      31,
+    "bitcoin":     3,
+    "litecoin":    6,
+    "dogecoin":    6,
+    "bitcoincash": 6,
+    "tron":        20,
+    "ton":         5,
 }
-PRICE_CACHE_TTL = 60
-RPC_TIMEOUT     = 10
-RECONNECT_DELAY = 5
-MAX_RETRIES     = 5
-POLL_INTERVAL   = 3
-POA_NETWORKS    = {"bsc", "polygon"}
+
+POLL_INTERVAL  = 30   # seconds between polls
+MAX_RETRIES    = 3
 
 
-# ── Data classes ──────────────────────────────────────────────────────────────
-
-@dataclass
-class WatchedAddress:
-    network:        str
-    address:        str
-    label:          str = ""           # e.g. "user:42" for routing callbacks
-    token_address:  Optional[str] = None   # None = native token
-    token_symbol:   Optional[str] = None
-    token_decimals: int = 18
-
+# ── Deposit event ──────────────────────────────────────────────────────────────
 
 @dataclass
 class DepositEvent:
+    user_id:       int
     network:       str
-    address:       str               # recipient
-    from_address:  str
+    coin_symbol:   str
     amount:        Decimal
-    token_symbol:  str
     tx_hash:       str
-    block_number:  int
-    confirmations: int
-    confirmed:     bool
+    confirmations: int      = 0
+    confirmed:     bool     = False
     usd_value:     Optional[Decimal] = None
-    label:         str = ""
+    address:       str      = ""
 
 
 @dataclass
-class TxStatus:
-    tx_hash:       str
-    network:       str
-    confirmations: int
-    confirmed:     bool
-    block_number:  Optional[int]
-    status:        str               # "pending" | "confirmed" | "failed"
+class WatchedAddress:
+    user_id:     int
+    address:     str
+    network:     str
+    coin_symbol: str
+    added_at:    float = field(default_factory=time.time)
 
 
-# ── Exceptions ────────────────────────────────────────────────────────────────
+# ── BlockCypher client (BTC/LTC/DOGE/BCH) ────────────────────────────────────
 
-class BlockchainError(Exception):    pass
-class RPCConnectionError(BlockchainError): pass
+BC_COIN_MAP = {
+    "bitcoin":     "btc/main",
+    "litecoin":    "ltc/main",
+    "dogecoin":    "doge/main",
+    "bitcoincash": "bcy/main",   # BlockCypher uses bcy for BCH
+}
+BC_SYMBOL_MAP = {
+    "bitcoin": "BTC", "litecoin": "LTC",
+    "dogecoin": "DOGE", "bitcoincash": "BCH",
+}
 
+class BlockCypherMonitor:
+    BASE = "https://api.blockcypher.com/v1"
 
-# ── RPC wrappers ──────────────────────────────────────────────────────────────
+    def __init__(self, api_key: str, session: aiohttp.ClientSession) -> None:
+        self._key     = api_key
+        self._session = session
+        # address → last seen tx hashes
+        self._seen: Dict[str, Set[str]] = {}
 
-class EVMConnection:
-    """AsyncWeb3 with health-check and reconnect."""
-
-    def __init__(self, network: str, rpc_url: str) -> None:
-        self.network    = network
-        self.rpc_url    = rpc_url
-        self.w3:        Optional[AsyncWeb3] = None
-        self._connected = False
-
-    async def connect(self) -> bool:
-        for attempt in range(1, MAX_RETRIES + 1):
-            try:
-                w3 = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(
-                    self.rpc_url, request_kwargs={"timeout": RPC_TIMEOUT}
-                ))
-                if self.network in POA_NETWORKS:
-                    w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
-                await asyncio.wait_for(w3.eth.block_number, timeout=RPC_TIMEOUT)
-                self.w3 = w3
-                self._connected = True
-                logger.info("[%s] RPC connected: %s", self.network, self.rpc_url)
-                return True
-            except Exception as exc:
-                logger.warning("[%s] Connect attempt %d/%d: %s", self.network, attempt, MAX_RETRIES, exc)
-                if attempt < MAX_RETRIES:
-                    await asyncio.sleep(RECONNECT_DELAY * attempt)
-        self._connected = False
-        return False
-
-    async def ensure(self) -> AsyncWeb3:
-        if self._connected and self.w3:
-            try:
-                await asyncio.wait_for(self.w3.eth.block_number, timeout=RPC_TIMEOUT)
-                return self.w3
-            except Exception:
-                self._connected = False
-        if not await self.connect():
-            raise RPCConnectionError(f"[{self.network}] Cannot connect to RPC")
-        return self.w3   # type: ignore
-
-    async def block_number(self) -> int:
-        return await asyncio.wait_for((await self.ensure()).eth.block_number, RPC_TIMEOUT)
-
-    async def receipt(self, tx_hash: str):
+    async def check_address(self, wa: WatchedAddress) -> List[DepositEvent]:
+        coin_path = BC_COIN_MAP.get(wa.network)
+        if not coin_path:
+            return []
+        sym = BC_SYMBOL_MAP.get(wa.network, wa.coin_symbol)
+        url = f"{self.BASE}/{coin_path}/addrs/{wa.address}?token={self._key}&limit=10"
         try:
-            return await asyncio.wait_for(
-                (await self.ensure()).eth.get_transaction_receipt(tx_hash), RPC_TIMEOUT
+            async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.status != 200:
+                    return []
+                data = await r.json()
+        except Exception as exc:
+            logger.warning("BlockCypher check %s failed: %s", wa.address[:12], exc)
+            return []
+
+        events = []
+        txrefs = data.get("txrefs", []) + data.get("unconfirmed_txrefs", [])
+        seen   = self._seen.setdefault(wa.address, set())
+
+        for tx in txrefs:
+            tx_hash = tx.get("tx_hash", "")
+            if tx_hash in seen:
+                continue
+            # Only incoming (received) txs
+            if not tx.get("received"):
+                continue
+            value_sat   = tx.get("value", 0)
+            confs       = tx.get("confirmations", 0)
+            required    = CONFIRMATIONS.get(wa.network, 6)
+            confirmed   = confs >= required
+            # Convert satoshis to coin
+            amount = Decimal(value_sat) / Decimal(10 ** 8)
+            if amount <= 0:
+                continue
+            ev = DepositEvent(
+                user_id=wa.user_id, network=wa.network,
+                coin_symbol=sym, amount=amount,
+                tx_hash=tx_hash, confirmations=confs,
+                confirmed=confirmed, address=wa.address,
             )
-        except (TransactionNotFound, Exception):
+            if confirmed:
+                seen.add(tx_hash)
+            events.append(ev)
+        return events
+
+
+# ── TronGrid client (TRX + USDT TRC-20) ──────────────────────────────────────
+
+TRON_USDT_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+
+class TronMonitor:
+    BASE = "https://api.trongrid.io"
+
+    def __init__(self, api_key: str, session: aiohttp.ClientSession) -> None:
+        self._key     = api_key
+        self._session = session
+        self._seen: Dict[str, Set[str]] = {}
+        self._headers = {"TRON-PRO-API-KEY": api_key}
+
+    async def check_address(self, wa: WatchedAddress) -> List[DepositEvent]:
+        events = []
+        # Check TRX native transfers
+        events += await self._check_trx(wa)
+        # Check USDT TRC-20 transfers
+        if wa.coin_symbol in ("USDT", "TRX"):
+            events += await self._check_trc20(wa)
+        return events
+
+    async def _check_trx(self, wa: WatchedAddress) -> List[DepositEvent]:
+        url = f"{self.BASE}/v1/accounts/{wa.address}/transactions?limit=20&only_confirmed=true"
+        try:
+            async with self._session.get(url, headers=self._headers,
+                                          timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.status != 200: return []
+                data = await r.json()
+        except Exception as exc:
+            logger.warning("TronGrid TRX check failed: %s", exc)
+            return []
+
+        seen   = self._seen.setdefault(wa.address + ":trx", set())
+        events = []
+        for tx in data.get("data", []):
+            tx_id = tx.get("txID", "")
+            if tx_id in seen: continue
+            raw = tx.get("raw_data", {})
+            for contract in raw.get("contract", []):
+                if contract.get("type") != "TransferContract": continue
+                val = contract.get("parameter", {}).get("value", {})
+                if val.get("to_address", "").upper() != wa.address.upper(): continue
+                amount = Decimal(val.get("amount", 0)) / Decimal(10 ** 6)
+                if amount <= 0: continue
+                seen.add(tx_id)
+                events.append(DepositEvent(
+                    user_id=wa.user_id, network="tron",
+                    coin_symbol="TRX", amount=amount,
+                    tx_hash=tx_id, confirmations=20,
+                    confirmed=True, address=wa.address,
+                ))
+        return events
+
+    async def _check_trc20(self, wa: WatchedAddress) -> List[DepositEvent]:
+        url = (f"{self.BASE}/v1/accounts/{wa.address}/transactions/trc20"
+               f"?limit=20&contract_address={TRON_USDT_CONTRACT}")
+        try:
+            async with self._session.get(url, headers=self._headers,
+                                          timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.status != 200: return []
+                data = await r.json()
+        except Exception as exc:
+            logger.warning("TronGrid TRC20 check failed: %s", exc)
+            return []
+
+        seen   = self._seen.setdefault(wa.address + ":usdt_trc20", set())
+        events = []
+        for tx in data.get("data", []):
+            tx_id = tx.get("transaction_id", "")
+            if tx_id in seen: continue
+            if tx.get("to", "").upper() != wa.address.upper(): continue
+            if not tx.get("confirmed", False): continue
+            amount = Decimal(tx.get("value", "0")) / Decimal(10 ** 6)
+            if amount <= 0: continue
+            seen.add(tx_id)
+            events.append(DepositEvent(
+                user_id=wa.user_id, network="tron",
+                coin_symbol="USDT", amount=amount,
+                tx_hash=tx_id, confirmations=20,
+                confirmed=True, address=wa.address,
+            ))
+        return events
+
+
+# ── TONCenter client (TON) ────────────────────────────────────────────────────
+
+class TONMonitor:
+    BASE = "https://toncenter.com/api/v2"
+
+    def __init__(self, api_key: str, session: aiohttp.ClientSession) -> None:
+        self._key     = api_key
+        self._session = session
+        self._seen: Dict[str, Set[str]] = {}
+        self._headers = {"X-API-Key": api_key}
+
+    async def check_address(self, wa: WatchedAddress) -> List[DepositEvent]:
+        url = f"{self.BASE}/getTransactions?address={wa.address}&limit=20"
+        try:
+            async with self._session.get(url, headers=self._headers,
+                                          timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.status != 200: return []
+                data = await r.json()
+        except Exception as exc:
+            logger.warning("TONCenter check failed: %s", exc)
+            return []
+
+        if not data.get("ok"): return []
+        seen   = self._seen.setdefault(wa.address, set())
+        events = []
+        for tx in data.get("result", []):
+            tx_id = str(tx.get("transaction_id", {}).get("hash", ""))
+            if tx_id in seen: continue
+            msg   = tx.get("in_msg", {})
+            if not msg: continue
+            value = int(msg.get("value", 0))
+            if value <= 0: continue
+            # TON uses nanoTON
+            amount = Decimal(value) / Decimal(10 ** 9)
+            seen.add(tx_id)
+            events.append(DepositEvent(
+                user_id=wa.user_id, network="ton",
+                coin_symbol="TON", amount=amount,
+                tx_hash=tx_id, confirmations=5,
+                confirmed=True, address=wa.address,
+            ))
+        return events
+
+
+# ── EVM monitor (ETH/BSC/Polygon via Alchemy) ─────────────────────────────────
+
+EVM_NATIVE = {"ethereum": "ETH", "bsc": "BNB", "polygon": "MATIC"}
+
+# ERC-20 contract addresses we watch
+ERC20_WATCH = {
+    "ethereum": {
+        "USDT":  "0xdAC17F958D2ee523a2206206994597C13D831ec7",
+        "USDC":  "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+        "DAI":   "0x6B175474E89094C44Da98b954EedeAC495271d0F",
+        "SHIB":  "0x95aD61b0a150d79219dCF64E1E6Cc01f0B64C4cE",
+    },
+    "bsc": {
+        "USDT":  "0x55d398326f99059fF775485246999027B3197955",
+        "USDC":  "0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d",
+    },
+    "polygon": {
+        "USDT":  "0xc2132D05D31c914a87C6611C10748AEb04B58e8F",
+        "USDC":  "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",
+        "DAI":   "0x8f3Cf7ad23Cd3CaDbD9735AFf958023239c6A063",
+        "MATIC": None,  # native
+    },
+}
+
+# ERC-20 Transfer event topic
+TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+
+class EVMMonitor:
+    def __init__(self, session: aiohttp.ClientSession) -> None:
+        self._session  = session
+        self._seen:    Dict[str, Set[str]] = {}
+        self._last_block: Dict[str, int]  = {}
+
+    async def check_address(self, wa: WatchedAddress, rpc_url: str) -> List[DepositEvent]:
+        net    = wa.network
+        events = []
+        events += await self._check_native(wa, rpc_url)
+        for sym, contract in ERC20_WATCH.get(net, {}).items():
+            if contract:
+                events += await self._check_erc20(wa, rpc_url, sym, contract)
+        return events
+
+    async def _rpc(self, url: str, method: str, params: list) -> Optional[dict]:
+        payload = {"jsonrpc":"2.0","id":1,"method":method,"params":params}
+        try:
+            async with self._session.post(url, json=payload,
+                                           timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.status != 200: return None
+                return await r.json()
+        except Exception as exc:
+            logger.warning("EVM RPC %s failed: %s", method, exc)
             return None
 
-    async def get_logs(self, params: dict) -> list:
-        return await asyncio.wait_for((await self.ensure()).eth.get_logs(params), RPC_TIMEOUT)  # type: ignore
+    async def _check_native(self, wa: WatchedAddress, rpc_url: str) -> List[DepositEvent]:
+        # Get latest block
+        res = await self._rpc(rpc_url, "eth_blockNumber", [])
+        if not res or "result" not in res: return []
+        latest = int(res["result"], 16)
+        last   = self._last_block.get(wa.address + wa.network, latest - 10)
+
+        # Use eth_getBalance to detect balance changes (simpler than scanning blocks)
+        # For proper monitoring use Alchemy's getAssetTransfers
+        rpc_url_clean = rpc_url.split("/v2/")[0] + "/v2/" + rpc_url.split("/v2/")[-1]
+        url = rpc_url_clean.replace("https://", "https://")
+
+        # Use Alchemy's alchemy_getAssetTransfers if available
+        params = [{
+            "fromBlock":  hex(last + 1),
+            "toBlock":    "latest",
+            "toAddress":  wa.address,
+            "category":   ["external"],
+            "withMetadata": False,
+            "excludeZeroValue": True,
+            "maxCount":   "0x14",
+        }]
+        res2 = await self._rpc(rpc_url, "alchemy_getAssetTransfers", params)
+        if not res2 or "result" not in res2:
+            self._last_block[wa.address + wa.network] = latest
+            return []
+
+        seen   = self._seen.setdefault(wa.address + wa.network + ":native", set())
+        events = []
+        native_sym = EVM_NATIVE.get(wa.network, "ETH")
+        required   = CONFIRMATIONS.get(wa.network, 12)
+
+        for tx in res2["result"].get("transfers", []):
+            tx_hash = tx.get("hash", "")
+            if tx_hash in seen: continue
+            value = tx.get("value", 0) or 0
+            amount = Decimal(str(value))
+            if amount <= 0: continue
+            block_num = int(tx.get("blockNum", "0x0"), 16)
+            confs     = latest - block_num
+            confirmed = confs >= required
+            ev = DepositEvent(
+                user_id=wa.user_id, network=wa.network,
+                coin_symbol=native_sym, amount=amount,
+                tx_hash=tx_hash, confirmations=confs,
+                confirmed=confirmed, address=wa.address,
+            )
+            if confirmed:
+                seen.add(tx_hash)
+            events.append(ev)
+
+        self._last_block[wa.address + wa.network] = latest
+        return events
+
+    async def _check_erc20(self, wa: WatchedAddress, rpc_url: str,
+                            sym: str, contract: str) -> List[DepositEvent]:
+        res = await self._rpc(rpc_url, "eth_blockNumber", [])
+        if not res or "result" not in res: return []
+        latest = int(res["result"], 16)
+        last   = self._last_block.get(wa.address + wa.network, latest - 10)
+        addr_padded = "0x" + wa.address[2:].zfill(64).lower()
+        params = [{
+            "fromBlock": hex(last + 1),
+            "toBlock":   "latest",
+            "address":   contract,
+            "topics":    [TRANSFER_TOPIC, None, addr_padded],
+        }]
+        res2 = await self._rpc(rpc_url, "eth_getLogs", params)
+        if not res2 or "result" not in res2: return []
+
+        seen     = self._seen.setdefault(wa.address + wa.network + ":" + sym, set())
+        events   = []
+        required = CONFIRMATIONS.get(wa.network, 12)
+
+        # Token decimals
+        decimals = {"USDT":6,"USDC":6,"DAI":18,"SHIB":18}.get(sym, 18)
+
+        for log in res2["result"]:
+            tx_hash = log.get("transactionHash", "")
+            if tx_hash in seen: continue
+            data     = log.get("data", "0x")
+            value    = int(data, 16) if data and data != "0x" else 0
+            amount   = Decimal(value) / Decimal(10 ** decimals)
+            if amount <= 0: continue
+            block_hex = log.get("blockNumber", "0x0")
+            block_num = int(block_hex, 16) if block_hex else latest
+            confs     = latest - block_num
+            confirmed = confs >= required
+            ev = DepositEvent(
+                user_id=wa.user_id, network=wa.network,
+                coin_symbol=sym, amount=amount,
+                tx_hash=tx_hash, confirmations=confs,
+                confirmed=confirmed, address=wa.address,
+            )
+            if confirmed:
+                seen.add(tx_hash)
+            events.append(ev)
+        return events
 
 
-class SolanaConnection:
-    """SolanaClient with reconnect."""
+# ── Solana monitor ────────────────────────────────────────────────────────────
 
-    def __init__(self, rpc_url: str) -> None:
-        self.rpc_url    = rpc_url
-        self.client:    Optional[SolanaClient] = None
-        self._connected = False
+class SolanaMonitor:
+    def __init__(self, rpc_url: str, session: aiohttp.ClientSession) -> None:
+        self._url     = rpc_url
+        self._session = session
+        self._seen:   Dict[str, Set[str]] = {}
 
-    async def connect(self) -> bool:
-        for attempt in range(1, MAX_RETRIES + 1):
-            try:
-                if self.client:
-                    await self.client.close()
-                self.client = SolanaClient(self.rpc_url)
-                await asyncio.wait_for(self.client.get_health(), RPC_TIMEOUT)
-                self._connected = True
-                logger.info("[solana] RPC connected: %s", self.rpc_url)
-                return True
-            except Exception as exc:
-                logger.warning("[solana] Connect attempt %d/%d: %s", attempt, MAX_RETRIES, exc)
-                if attempt < MAX_RETRIES:
-                    await asyncio.sleep(RECONNECT_DELAY * attempt)
-        return False
+    async def _rpc(self, method: str, params: list) -> Optional[dict]:
+        try:
+            async with self._session.post(self._url,
+                json={"jsonrpc":"2.0","id":1,"method":method,"params":params},
+                timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.status != 200: return None
+                return await r.json()
+        except Exception as exc:
+            logger.warning("Solana RPC %s failed: %s", method, exc)
+            return None
 
-    async def ensure(self) -> SolanaClient:
-        if self._connected and self.client:
-            try:
-                await asyncio.wait_for(self.client.get_health(), RPC_TIMEOUT)
-                return self.client
-            except Exception:
-                self._connected = False
-        if not await self.connect():
-            raise RPCConnectionError("[solana] Cannot connect to RPC")
-        return self.client   # type: ignore
-
-    async def close(self) -> None:
-        if self.client:
-            await self.client.close()
+    async def check_address(self, wa: WatchedAddress) -> List[DepositEvent]:
+        res = await self._rpc("getSignaturesForAddress", [wa.address, {"limit": 20}])
+        if not res or "result" not in res: return []
+        seen   = self._seen.setdefault(wa.address, set())
+        events = []
+        for sig_info in res["result"]:
+            sig = sig_info.get("signature", "")
+            if sig in seen: continue
+            if sig_info.get("err"): continue
+            # Get transaction details
+            tx_res = await self._rpc("getTransaction",
+                [sig, {"encoding":"jsonParsed","maxSupportedTransactionVersion":0}])
+            if not tx_res or not tx_res.get("result"): continue
+            tx   = tx_res["result"]
+            meta = tx.get("meta", {})
+            if meta.get("err"): continue
+            # Find SOL transfer to our address
+            account_keys = tx.get("transaction",{}).get("message",{}).get("accountKeys",[])
+            pre_balances  = meta.get("preBalances", [])
+            post_balances = meta.get("postBalances", [])
+            for i, key_info in enumerate(account_keys):
+                key = key_info if isinstance(key_info, str) else key_info.get("pubkey","")
+                if key.lower() != wa.address.lower(): continue
+                if i >= len(pre_balances) or i >= len(post_balances): continue
+                diff = post_balances[i] - pre_balances[i]
+                if diff <= 0: continue
+                amount = Decimal(diff) / Decimal(10 ** 9)
+                seen.add(sig)
+                events.append(DepositEvent(
+                    user_id=wa.user_id, network="solana",
+                    coin_symbol="SOL", amount=amount,
+                    tx_hash=sig, confirmations=31,
+                    confirmed=True, address=wa.address,
+                ))
+                break
+        return events
 
 
 # ── Price feed ────────────────────────────────────────────────────────────────
 
-class PriceFeed:
-    """CoinGecko free-tier price cache with 60-second TTL."""
+COINGECKO_IDS = {
+    "BTC":"bitcoin","ETH":"ethereum","USDT":"tether","USDC":"usd-coin",
+    "LTC":"litecoin","SOL":"solana","BNB":"binancecoin","TRX":"tron",
+    "XMR":"monero","DAI":"dai","DOGE":"dogecoin","SHIB":"shiba-inu",
+    "BCH":"bitcoin-cash","MATIC":"matic-network","TON":"the-open-network",
+}
 
-    _URL = "https://api.coingecko.com/api/v3/simple/price"
+class PriceFeed:
+    _TTL = 60
 
     def __init__(self) -> None:
         self._cache:      Dict[str, Decimal] = {}
         self._cache_time: float = 0.0
         self._session:    Optional[aiohttp.ClientSession] = None
 
-    async def _session_get(self) -> aiohttp.ClientSession:
-        if self._session is None or self._session.closed:
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if not self._session or self._session.closed:
             self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10))
         return self._session
 
-    async def get_price(self, symbol: str) -> Optional[Decimal]:
-        symbol = symbol.upper()
-        if time.monotonic() - self._cache_time < PRICE_CACHE_TTL and symbol in self._cache:
-            return self._cache[symbol]
+    async def get_usd_prices(self) -> Dict[str, Decimal]:
+        if time.monotonic() - self._cache_time < self._TTL and self._cache:
+            return dict(self._cache)
         await self._refresh()
-        return self._cache.get(symbol)
+        return dict(self._cache)
 
-    async def usd_value(self, symbol: str, amount: Decimal) -> Optional[Decimal]:
-        price = await self.get_price(symbol)
-        return (price * amount).quantize(Decimal("0.01")) if price is not None else None
+    async def get_price(self, coin: str) -> Optional[Decimal]:
+        p = await self.get_usd_prices()
+        return p.get(coin.upper())
+
+    async def coin_to_usd(self, coin: str, amount: Decimal) -> Optional[Decimal]:
+        price = await self.get_price(coin)
+        if not price: return None
+        return (price * amount).quantize(Decimal("0.01"))
+
+    async def usd_to_coin(self, usd: Decimal, coin: str) -> Optional[Decimal]:
+        price = await self.get_price(coin)
+        if not price or price == 0: return None
+        return (usd / price).quantize(Decimal("0.00000001"))
 
     async def _refresh(self) -> None:
         ids = ",".join(COINGECKO_IDS.values())
         try:
-            sess = await self._session_get()
-            async with sess.get(self._URL, params={"ids": ids, "vs_currencies": "usd"}) as resp:
-                if resp.status != 200:
-                    return
-                data = await resp.json()
+            session = await self._get_session()
+            async with session.get(
+                f"https://api.coingecko.com/api/v3/simple/price?ids={ids}&vs_currencies=usd"
+            ) as r:
+                if r.status != 200: return
+                data = await r.json()
             for sym, cg_id in COINGECKO_IDS.items():
                 if cg_id in data and "usd" in data[cg_id]:
                     self._cache[sym] = Decimal(str(data[cg_id]["usd"]))
             self._cache_time = time.monotonic()
-        except asyncio.CancelledError:
-            raise
+            logger.debug("PriceFeed refreshed: %d coins", len(self._cache))
         except Exception as exc:
-            logger.warning("[price] Refresh failed (using cache): %s", exc)
+            logger.warning("PriceFeed refresh failed: %s", exc)
 
     async def close(self) -> None:
         if self._session and not self._session.closed:
             await self._session.close()
 
 
-# ── BlockchainMonitor ─────────────────────────────────────────────────────────
-
-DepositCallback = Callable[[DepositEvent], object]
-
+# ── Master BlockchainMonitor ──────────────────────────────────────────────────
 
 class BlockchainMonitor:
     """
-    Monitors deposit addresses for inbound transactions on all chains.
-    Fires `callback` twice per deposit: once on detection (confirmed=False)
-    and again when the required confirmation threshold is met (confirmed=True).
+    Polls all watched addresses every POLL_INTERVAL seconds.
+    On confirmed deposit, calls on_deposit(DepositEvent).
     """
 
-    def __init__(self, callback: Optional[DepositCallback] = None) -> None:
-        self._callback = callback
-        self._evm:  Dict[str, EVMConnection]  = {}
-        self._sol:  Optional[SolanaConnection] = None
-        self._prices = PriceFeed()
+    def __init__(self, on_deposit: Callable, api_keys: dict) -> None:
+        self._on_deposit  = on_deposit
+        self._api_keys    = api_keys
+        self._watched:    List[WatchedAddress] = []
+        self._price_feed  = PriceFeed()
+        self._session:    Optional[aiohttp.ClientSession] = None
+        self._task:       Optional[asyncio.Task] = None
+        self._running     = False
 
-        self._watched:    Dict[str, List[WatchedAddress]] = {
-            n: [] for n in ("ethereum", "bsc", "polygon", "solana")
-        }
-        self._pending:    Dict[str, tuple[DepositEvent, int]] = {}
-        self._seen_txs:   Set[str] = set()
-        self._sol_cursors: Dict[str, Optional[str]] = {}
-        self._tasks:  List[asyncio.Task] = []
-        self._running = False
+        # Sub-monitors (initialised in start())
+        self._bc:   Optional[BlockCypherMonitor] = None
+        self._tron: Optional[TronMonitor]        = None
+        self._ton:  Optional[TONMonitor]         = None
+        self._evm:  Optional[EVMMonitor]         = None
+        self._sol:  Optional[SolanaMonitor]      = None
+
+    def add_address(self, wa: WatchedAddress) -> None:
+        # Avoid duplicates
+        for existing in self._watched:
+            if existing.address == wa.address and existing.network == wa.network:
+                return
+        self._watched.append(wa)
+        logger.info("Watching %s on %s for user %d", wa.address[:12], wa.network, wa.user_id)
+
+    def remove_address(self, address: str, network: str) -> None:
+        self._watched = [w for w in self._watched
+                         if not (w.address == address and w.network == network)]
 
     async def start(self) -> None:
-        for net, url in cfg.rpc_urls.items():
-            if net == "solana":
-                self._sol = SolanaConnection(url)
-                await self._sol.connect()
-            else:
-                conn = EVMConnection(net, url)
-                await conn.connect()
-                self._evm[net] = conn
-
+        self._session = aiohttp.ClientSession()
+        self._bc   = BlockCypherMonitor(self._api_keys.get("blockcypher", ""), self._session)
+        self._tron = TronMonitor(self._api_keys.get("trongrid", ""), self._session)
+        self._ton  = TONMonitor(self._api_keys.get("toncenter", ""), self._session)
+        self._evm  = EVMMonitor(self._session)
+        self._sol  = SolanaMonitor(cfg.solana_rpc_url, self._session)
         self._running = True
-        for net in ("ethereum", "bsc", "polygon"):
-            self._tasks.append(asyncio.create_task(
-                self._evm_loop(net), name=f"monitor-{net}"
-            ))
-        self._tasks.append(asyncio.create_task(self._sol_loop(), name="monitor-solana"))
-        self._tasks.append(asyncio.create_task(self._confirm_loop(), name="confirmations"))
-        logger.info("BlockchainMonitor started (%d networks)", len(self._evm) + 1)
+        self._task = asyncio.create_task(self._poll_loop(), name="blockchain-monitor")
+        logger.info("BlockchainMonitor started")
 
     async def stop(self) -> None:
         self._running = False
-        for t in self._tasks:
-            t.cancel()
-        await asyncio.gather(*self._tasks, return_exceptions=True)
-        self._tasks.clear()
-        for conn in self._evm.values():
-            try:
-                if conn.w3:
-                    await conn.w3.provider.disconnect()
-            except Exception:
-                pass
-        if self._sol:
-            await self._sol.close()
-        await self._prices.close()
+        if self._task:
+            self._task.cancel()
+            try: await self._task
+            except asyncio.CancelledError: pass
+        await self._price_feed.close()
+        if self._session and not self._session.closed:
+            await self._session.close()
+        logger.info("BlockchainMonitor stopped")
 
-    async def __aenter__(self) -> "BlockchainMonitor":
-        await self.start(); return self
-
-    async def __aexit__(self, *_) -> None:
-        await self.stop()
-
-    # ── Address registration ──────────────────────────────────────────────────
-
-    def watch(
-        self, network: str, address: str, label: str = "",
-        token_address: Optional[str] = None,
-        token_symbol:  Optional[str] = None,
-        token_decimals: int = 18,
-    ) -> None:
-        wa = WatchedAddress(
-            network=network, address=address, label=label,
-            token_address=token_address, token_symbol=token_symbol, token_decimals=token_decimals,
-        )
-        if not any(w.address == address and w.token_address == token_address
-                   for w in self._watched.get(network, [])):
-            self._watched.setdefault(network, []).append(wa)
-            if network == "solana":
-                self._sol_cursors.setdefault(address, None)
-            logger.info("[%s] Watching %s (%s)", network, address, label or "unlabelled")
-
-    def unwatch(self, network: str, address: str) -> None:
-        self._watched[network] = [w for w in self._watched.get(network, []) if w.address != address]
-
-    # ── Monitoring loops ──────────────────────────────────────────────────────
-
-    async def _evm_loop(self, network: str) -> None:
-        conn       = self._evm[network]
-        last_block: Optional[int] = None
+    async def _poll_loop(self) -> None:
         while self._running:
             try:
-                if not self._watched[network]:
-                    await asyncio.sleep(POLL_INTERVAL); continue
-                current = await conn.block_number()
-                if last_block is None:
-                    last_block = current - 1
-                if current > last_block:
-                    await self._scan_evm(network, conn, last_block + 1, current)
-                    last_block = current
-            except asyncio.CancelledError:
-                break
+                await self._poll_all()
             except Exception as exc:
-                logger.warning("[%s] Monitor error: %s", network, exc)
-                await asyncio.sleep(RECONNECT_DELAY)
+                logger.error("Poll loop error: %s", exc, exc_info=True)
             await asyncio.sleep(POLL_INTERVAL)
 
-    async def _scan_evm(
-        self, network: str, conn: EVMConnection, from_block: int, to_block: int
-    ) -> None:
-        watched  = self._watched[network]
-        erc20_w  = [w for w in watched if w.token_address]
-        native_w = [w for w in watched if not w.token_address]
-
-        # ERC-20 via eth_getLogs
-        if erc20_w:
-            to_topics = ["0x" + w.address[2:].lower().zfill(64) for w in erc20_w]
-            contracts  = list({w.token_address for w in erc20_w if w.token_address})
-            try:
-                logs = await conn.get_logs({
-                    "fromBlock": from_block, "toBlock": to_block,
-                    "address":   contracts,
-                    "topics":    [ERC20_TRANSFER_TOPIC, None, to_topics],
-                })
-                for log in logs:
-                    await self._process_erc20_log(network, log, erc20_w)
-            except Exception as exc:
-                logger.warning("[%s] ERC-20 scan error: %s", network, exc)
-
-        # Native via block transactions
-        if native_w:
-            w3  = await conn.ensure()
-            addr_set = {w.address.lower() for w in native_w}
-            for bn in range(from_block, to_block + 1):
-                try:
-                    block = await asyncio.wait_for(
-                        w3.eth.get_block(bn, full_transactions=True), RPC_TIMEOUT
-                    )
-                    for tx in block.get("transactions", []):
-                        if tx.get("to") and tx["to"].lower() in addr_set and tx["value"] > 0:
-                            await self._process_evm_native(network, tx, bn, native_w)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    logger.warning("[%s] Block %d error: %s", network, bn, exc)
-
-    async def _process_erc20_log(
-        self, network: str, log: dict, watched: List[WatchedAddress]
-    ) -> None:
-        tx_hash  = log["transactionHash"].hex()
-        if tx_hash in self._seen_txs:
+    async def _poll_all(self) -> None:
+        if not self._watched:
             return
-        topics = log.get("topics", [])
-        if len(topics) < 3:
-            return
-        to_addr = "0x" + topics[2].hex()[-40:]
-        matched = next(
-            (w for w in watched
-             if w.address.lower() == to_addr.lower()
-             and w.token_address and w.token_address.lower() == log["address"].lower()),
-            None,
-        )
-        if not matched:
-            return
-        raw    = int(log["data"].hex(), 16)
-        amount = Decimal(raw) / Decimal(10 ** matched.token_decimals)
-        usd    = await self._prices.usd_value(matched.token_symbol or "TOKEN", amount)
-        event  = DepositEvent(
-            network=network,
-            address=AsyncWeb3.to_checksum_address(to_addr),
-            from_address="0x" + topics[1].hex()[-40:],
-            amount=amount, token_symbol=matched.token_symbol or "TOKEN",
-            tx_hash=tx_hash, block_number=log["blockNumber"],
-            confirmations=0, confirmed=False,
-            usd_value=usd, label=matched.label,
-        )
-        self._seen_txs.add(tx_hash)
-        self._pending[tx_hash] = (event, REQUIRED_CONFIRMATIONS.get(network, 12))
-        await self._emit(event)
+        tasks = [self._poll_one(wa) for wa in list(self._watched)]
+        await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def _process_evm_native(
-        self, network: str, tx: dict, block: int, watched: List[WatchedAddress]
-    ) -> None:
-        tx_hash = tx["hash"].hex() if hasattr(tx["hash"], "hex") else tx["hash"]
-        if tx_hash in self._seen_txs:
-            return
-        matched = next(
-            (w for w in watched if not w.token_address and w.address.lower() == tx["to"].lower()),
-            None,
-        )
-        if not matched:
-            return
-        sym    = {"ethereum": "ETH", "bsc": "BNB", "polygon": "MATIC"}.get(network, "")
-        amount = Decimal(tx["value"]) / Decimal(10**18)
-        usd    = await self._prices.usd_value(sym, amount)
-        event  = DepositEvent(
-            network=network,
-            address=AsyncWeb3.to_checksum_address(tx["to"]),
-            from_address=tx.get("from", ""),
-            amount=amount, token_symbol=sym,
-            tx_hash=tx_hash, block_number=block,
-            confirmations=0, confirmed=False,
-            usd_value=usd, label=matched.label,
-        )
-        self._seen_txs.add(tx_hash)
-        self._pending[tx_hash] = (event, REQUIRED_CONFIRMATIONS.get(network, 12))
-        await self._emit(event)
+    async def _poll_one(self, wa: WatchedAddress) -> None:
+        net    = wa.network
+        events: List[DepositEvent] = []
 
-    async def _sol_loop(self) -> None:
-        while self._running:
-            try:
-                watched = self._watched.get("solana", [])
-                if not watched:
-                    await asyncio.sleep(POLL_INTERVAL); continue
-                client = await self._sol.ensure()
-                for w in watched:
-                    try:
-                        await self._scan_sol_address(client, w)
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as exc:
-                        logger.warning("[solana] Scan error %s: %s", w.address, exc)
-            except asyncio.CancelledError:
-                break
-            except Exception as exc:
-                logger.warning("[solana] Loop error: %s", exc)
-                await asyncio.sleep(RECONNECT_DELAY)
-            await asyncio.sleep(POLL_INTERVAL)
-
-    async def _scan_sol_address(self, client, watched: WatchedAddress) -> None:
-        pub  = Pubkey.from_string(watched.address)
-        last = self._sol_cursors.get(watched.address)
-        until = SolSignature.from_string(last) if last else None
-        resp  = await asyncio.wait_for(
-            client.get_signatures_for_address(pub, until=until, limit=20, commitment=SolanaConfirmed),
-            RPC_TIMEOUT,
-        )
-        sigs = resp.value
-        if not sigs:
-            return
-        self._sol_cursors[watched.address] = str(sigs[0].signature)
-        for sig_info in reversed(sigs):
-            sig_str = str(sig_info.signature)
-            if sig_str in self._seen_txs or sig_info.err:
-                continue
-            try:
-                tx_resp = await asyncio.wait_for(
-                    client.get_transaction(
-                        SolSignature.from_string(sig_str), max_supported_transaction_version=0
-                    ), RPC_TIMEOUT,
-                )
-            except Exception:
-                continue
-            if not tx_resp.value:
-                continue
-            tx   = tx_resp.value
-            meta = tx.transaction.meta
-            if not meta:
-                continue
-            keys = [str(k) for k in tx.transaction.transaction.message.account_keys]
-            try:
-                idx = keys.index(watched.address)
-            except ValueError:
-                continue
-            delta = meta.post_balances[idx] - meta.pre_balances[idx]
-            if delta <= 0:
-                continue
-            amount = Decimal(delta) / Decimal(10**9)
-            usd    = await self._prices.usd_value("SOL", amount)
-            event  = DepositEvent(
-                network="solana", address=watched.address,
-                from_address=keys[0] if keys else "unknown",
-                amount=amount, token_symbol="SOL",
-                tx_hash=sig_str, block_number=tx.slot or 0,
-                confirmations=0, confirmed=False,
-                usd_value=usd, label=watched.label,
-            )
-            self._seen_txs.add(sig_str)
-            self._pending[sig_str] = (event, REQUIRED_CONFIRMATIONS["solana"])
-            await self._emit(event)
-
-    # ── Confirmation loop ─────────────────────────────────────────────────────
-
-    async def _confirm_loop(self) -> None:
-        while self._running:
-            await asyncio.sleep(POLL_INTERVAL * 2)
-            to_remove: List[str] = []
-            for tx_hash, (event, required) in list(self._pending.items()):
-                try:
-                    confs = await self._get_confirmations(event.network, tx_hash, event.block_number)
-                    if confs is None:
-                        continue
-                    event.confirmations = confs
-                    if confs >= required and not event.confirmed:
-                        event.confirmed = True
-                        await self._emit(event)
-                        to_remove.append(tx_hash)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    logger.debug("[confirm] %s: %s", tx_hash[:12], exc)
-            for tx_hash in to_remove:
-                self._pending.pop(tx_hash, None)
-
-    async def _get_confirmations(
-        self, network: str, tx_hash: str, tx_block: int
-    ) -> Optional[int]:
         try:
-            if network == "solana":
-                client = await self._sol.ensure()
-                sig    = SolSignature.from_string(tx_hash)
-                resp   = await asyncio.wait_for(
-                    client.get_signature_statuses([sig], search_transaction_history=True), RPC_TIMEOUT
-                )
-                st = resp.value[0] if resp.value else None
-                if not st:
-                    return 0
-                if "finalized" in str(getattr(st, "confirmation_status", "")):
-                    return REQUIRED_CONFIRMATIONS["solana"]
-                return int(st.confirmations or 0)
-            else:
-                conn    = self._evm[network]
-                current = await conn.block_number()
-                receipt = await conn.receipt(tx_hash)
-                if not receipt:
-                    return 0
-                return max(0, current - receipt["blockNumber"])
-        except Exception:
-            return None
+            if net in ("ethereum", "bsc", "polygon") and self._evm:
+                rpc = cfg.rpc_urls.get(net, "")
+                if rpc:
+                    events = await self._evm.check_address(wa, rpc)
 
-    # ── Public query ──────────────────────────────────────────────────────────
+            elif net == "solana" and self._sol:
+                events = await self._sol.check_address(wa)
 
-    async def get_tx_status(self, network: str, tx_hash: str) -> TxStatus:
-        req = REQUIRED_CONFIRMATIONS.get(network, 12)
-        if network == "solana":
-            client = await self._sol.ensure()
-            sig    = SolSignature.from_string(tx_hash)
-            resp   = await asyncio.wait_for(
-                client.get_signature_statuses([sig], search_transaction_history=True), RPC_TIMEOUT
-            )
-            st = resp.value[0] if resp.value else None
-            if not st:
-                return TxStatus(tx_hash, network, 0, False, None, "pending")
-            confs = int(st.confirmations or 0)
-            ok    = st.err is None
-            cs    = str(getattr(st, "confirmation_status", ""))
-            conf  = "finalized" in cs or confs >= req
-            return TxStatus(tx_hash, network, confs, conf, None, "confirmed" if conf and ok else ("failed" if not ok else "pending"))
-        else:
-            conn    = self._evm[network]
-            current = await conn.block_number()
-            receipt = await conn.receipt(tx_hash)
-            if not receipt:
-                return TxStatus(tx_hash, network, 0, False, None, "pending")
-            confs = max(0, current - receipt["blockNumber"])
-            ok    = receipt.get("status") == 1
-            return TxStatus(
-                tx_hash, network, confs, confs >= req and ok,
-                receipt["blockNumber"], "confirmed" if ok else "failed"
-            )
+            elif net in ("bitcoin","litecoin","dogecoin","bitcoincash") and self._bc:
+                events = await self._bc.check_address(wa)
 
-    async def get_price(self, symbol: str) -> Optional[Decimal]:
-        return await self._prices.get_price(symbol)
+            elif net == "tron" and self._tron:
+                events = await self._tron.check_address(wa)
 
-    async def _emit(self, event: DepositEvent) -> None:
-        if self._callback:
-            try:
-                result = self._callback(event)
-                if asyncio.iscoroutine(result):
-                    await result
-            except Exception as exc:
-                logger.exception("Deposit callback raised: %s", exc)
-        else:
-            tag = "✅ CONFIRMED" if event.confirmed else "🔔 DETECTED"
-            logger.info(
-                "%s [%s] %s %s → %s | tx=%s | usd=%s",
-                tag, event.network, event.amount, event.token_symbol,
-                event.address, event.tx_hash[:12],
-                f"${event.usd_value:.2f}" if event.usd_value else "n/a",
-            )
+            elif net == "ton" and self._ton:
+                events = await self._ton.check_address(wa)
+
+        except Exception as exc:
+            logger.warning("Poll %s/%s failed: %s", net, wa.address[:12], exc)
+            return
+
+        for ev in events:
+            if ev.confirmed:
+                await self._handle_confirmed(ev)
+
+    async def _handle_confirmed(self, ev: DepositEvent) -> None:
+        # Get USD value
+        usd = await self._price_feed.coin_to_usd(ev.coin_symbol, ev.amount)
+        ev.usd_value = usd
+        logger.info(
+            "DEPOSIT CONFIRMED user=%d %s %s (~$%s) tx=%s",
+            ev.user_id, ev.amount, ev.coin_symbol,
+            f"{usd:.2f}" if usd else "?", ev.tx_hash[:16],
+        )
+        try:
+            await self._on_deposit(ev)
+        except Exception as exc:
+            logger.error("on_deposit callback failed: %s", exc, exc_info=True)
+
+    @property
+    def price_feed(self) -> PriceFeed:
+        return self._price_feed
+
+
+# ── Convenience export ─────────────────────────────────────────────────────────
+DepositEvent    = DepositEvent
+WatchedAddress  = WatchedAddress
+BlockchainMonitor = BlockchainMonitor
+PriceFeed       = PriceFeed

@@ -115,6 +115,10 @@ class Settings:
 
     # ChangeNow swap API
     changenow_api_key:     str
+    # Deposit monitoring APIs
+    blockcypher_api_key:   str
+    trongrid_api_key:      str
+    toncenter_api_key:     str
 
     @property
     def rpc_urls(self) -> dict[str, str]:
@@ -203,6 +207,9 @@ def _load_settings() -> Settings:
         house_address_solana  = _str("HOUSE_ADDRESS_SOLANA",  ""),
 
         changenow_api_key     = _str("CHANGENOW_API_KEY", ""),
+        blockcypher_api_key   = _str("BLOCKCYPHER_API_KEY", ""),
+        trongrid_api_key      = _str("TRONGRID_API_KEY", ""),
+        toncenter_api_key     = _str("TONCENTER_API_KEY", ""),
     )
     try:
         s.validate()
