@@ -84,6 +84,7 @@ from gaming_bot.telegram import (
 )
 from gaming_bot.wallet import WalletManager
 from gaming_bot.blockchain import BlockchainMonitor
+from gaming_bot import swap as swap_module
 
 logger = logging.getLogger("main")
 

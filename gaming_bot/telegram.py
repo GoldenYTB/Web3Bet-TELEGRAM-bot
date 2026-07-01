@@ -1,19 +1,19 @@
 """
-telegram.py — Everything Telegram-facing.
+telegram.py — All handlers, keyboards, health server, logging.
 
-Merges handlers.py + keyboards.py + health.py + logging_setup.py into one module.
+Unified USD balance system:
+- Deposits in any coin → converted to USD at deposit time
+- Bets placed in USD ($1, $5, $10 etc)
+- Withdrawals: choose coin → ChangeNow swaps USD balance to that coin
+- Preferred coin saved on first withdrawal
 
-Public API
-----------
-  configure_logging(...)    — Set up rotating logs with colour console output
-  start_health_server(...)  — Launch aiohttp health HTTP server
-  stop_health_server()      — Shut down health HTTP server
-  status_command(...)       — /status Telegram command handler
-  register_all_handlers(app)— Wire all PTB handlers onto an Application
+Group game commands: /dice /bowl /darts
+Private commands: /start /wallet /profile /tip /promo /admin /withdraw
 """
 from __future__ import annotations
 
 import asyncio
+import datetime
 import logging
 import logging.handlers
 import sys
@@ -25,9 +25,10 @@ from typing import Optional
 
 from aiohttp import web
 from telegram import (
-    BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update,
+    BotCommand, InlineKeyboardButton, InlineKeyboardMarkup,
+    Update,
 )
-from telegram.constants import ParseMode
+from telegram.constants import ParseMode, DiceEmoji
 from telegram.error import BadRequest, Forbidden, TelegramError
 from telegram.ext import (
     Application, CallbackQueryHandler, CommandHandler,
@@ -35,752 +36,1238 @@ from telegram.ext import (
 )
 
 from .config import (
+    cfg, COINS, NETWORKS, GAME_TYPES, GAME_MODES, PRESET_WAGERS,
+    DEFAULT_ADMIN_STATE, MIN_WAGER, MAX_WAGER, HOUSE_FEE_PCT, State,
     CB_BACK_MAIN, CB_CANCEL,
-    CB_LOBBY_CANCEL, CB_LOBBY_CONFIRM, CB_LOBBY_CUSTOM,
-    CB_LOBBY_GAME, CB_LOBBY_NETWORK, CB_LOBBY_TOKEN, CB_LOBBY_WAGER,
-    CB_MATCH_CANCEL,
-    CB_MENU_HELP, CB_MENU_LEADERBOARD, CB_MENU_PLAY, CB_MENU_WALLET,
-    CB_WALLET_DEPOSIT, CB_WALLET_REFRESH, CB_WALLET_WITHDRAW,
-    GAME_TYPES, MATCHMAKING_TTL, MAX_WAGER, MIN_WAGER,
-    NETWORKS, PRESET_WAGERS, TOKENS_BY_NETWORK, State,
+    CB_MENU_PROFILE, CB_MENU_WALLET, CB_MENU_HELP, CB_MENU_REFERRAL,
+    CB_PROFILE_HISTORY, CB_PROFILE_LEADERBOARD, CB_PROFILE_TRANSFER,
+    CB_PROFILE_SETTINGS, CB_PROFILE_REFERRAL,
+    CB_WALLET_DEPOSIT, CB_WALLET_WITHDRAW, CB_WALLET_REFRESH,
+    CB_WALLET_TIP, CB_WALLET_PROMO,
+    CB_COIN_PREFIX, CB_NET_PREFIX,
+    CB_GAME_PREFIX, CB_MODE_PREFIX, CB_WAGER_PREFIX, CB_WAGER_CUSTOM,
+    CB_GAME_JOIN, CB_GAME_CANCEL,
+    CB_ADMIN_BOT_TOGGLE, CB_ADMIN_HOUSE_ADDR, CB_ADMIN_REFERRAL_AMT,
+    CB_ADMIN_ADD_PROMO, CB_ADMIN_LIST_PROMOS, CB_ADMIN_TIP_LIMITS,
+    CB_ADMIN_STATS, CB_ADMIN_PREFIX,
 )
-from .games import game_result_text, resolve_game
-from .models import ActiveGame, GameStatus, GameType, PendingGame, Store, User
+from .games import GroupGame, GameType, GameMode, GameStatus, result_text, lobby_text, active_text
+from .models import Store, User
+from . import swap as swap_module
 
 logger = logging.getLogger(__name__)
 _START_TIME: float = time.time()
+_runner = None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Logging setup
+#  Logging
 # ══════════════════════════════════════════════════════════════════════════════
 
-_THIRD_PARTY_QUIET = {
-    "httpx", "httpcore", "telegram", "telegram.ext",
-    "apscheduler", "asyncio", "sqlalchemy.engine",
-    "sqlalchemy.pool", "aiohttp", "web3",
-}
-_COLOURS = {
-    "DEBUG": "\033[36m", "INFO": "\033[32m", "WARNING": "\033[33m",
-    "ERROR": "\033[31m", "CRITICAL": "\033[35m",
-}
-_RESET = "\033[0m"
+_QUIET = {"httpx","httpcore","telegram","telegram.ext","apscheduler",
+          "asyncio","sqlalchemy.engine","aiohttp","web3"}
+_COL   = {"DEBUG":"\033[36m","INFO":"\033[32m","WARNING":"\033[33m",
+           "ERROR":"\033[31m","CRITICAL":"\033[35m"}
 
-
-class _ColourFmt(logging.Formatter):
-    _FMT  = "%(asctime)s [%(levelname)s] %(name)s — %(message)s"
-    _DATE = "%H:%M:%S"
-
-    def format(self, record: logging.LogRecord) -> str:
-        r = logging.makeLogRecord(record.__dict__)
+class _CFmt(logging.Formatter):
+    def format(self, r):
+        r2 = logging.makeLogRecord(r.__dict__)
         if sys.stderr.isatty():
-            c = _COLOURS.get(r.levelname, "")
-            r.levelname = f"{c}{r.levelname:8s}{_RESET}"
-        return logging.Formatter(self._FMT, datefmt=self._DATE).format(r)
+            r2.levelname = f"{_COL.get(r2.levelname,'')}{r2.levelname:8s}\033[0m"
+        return logging.Formatter("%(asctime)s [%(levelname)s] %(name)s — %(message)s","%H:%M:%S").format(r2)
 
-
-class _PlainFmt(logging.Formatter):
-    _FMT  = "%(asctime)s [%(levelname)-8s] %(name)s — %(message)s"
-    _DATE = "%Y-%m-%d %H:%M:%S"
-    def __init__(self): super().__init__(fmt=self._FMT, datefmt=self._DATE)
-
-
-def configure_logging(
-    level: str = "INFO", log_file: str = "",
-    max_bytes: int = 10*1024*1024, backup_count: int = 5,
-) -> None:
-    """Configure root logger with colour console + optional rotating file."""
-    num  = getattr(logging, level.upper(), logging.INFO)
-    root = logging.getLogger()
-    root.setLevel(num)
-    root.handlers.clear()
-
-    console = logging.StreamHandler(sys.stderr)
-    console.setLevel(num)
-    console.setFormatter(_ColourFmt())
-    root.addHandler(console)
-
+def configure_logging(level="INFO", log_file="", max_bytes=10*1024*1024, backup_count=5):
+    num = getattr(logging, level.upper(), logging.INFO)
+    root = logging.getLogger(); root.setLevel(num); root.handlers.clear()
+    ch = logging.StreamHandler(sys.stderr); ch.setLevel(num); ch.setFormatter(_CFmt())
+    root.addHandler(ch)
     if log_file:
-        p = Path(log_file)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        fh = logging.handlers.RotatingFileHandler(
-            p, maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8"
-        )
-        fh.setLevel(num); fh.setFormatter(_PlainFmt())
+        p = Path(log_file); p.parent.mkdir(parents=True, exist_ok=True)
+        fh = logging.handlers.RotatingFileHandler(p, maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8")
+        fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)-8s] %(name)s — %(message)s"))
         root.addHandler(fh)
-
-    for name in _THIRD_PARTY_QUIET:
-        logging.getLogger(name).setLevel(max(num, logging.WARNING))
-
-    logging.getLogger(__name__).info("Logging: level=%s file=%s", level, log_file or "stdout")
+    for n in _QUIET:
+        logging.getLogger(n).setLevel(max(num, logging.WARNING))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Health check HTTP server
+#  Health server
 # ══════════════════════════════════════════════════════════════════════════════
 
-_runner: Optional[web.AppRunner] = None
-
-
-async def _health_handler(request: web.Request) -> web.Response:
-    from .database import ping, pool_status
-    db_ok, db_msg = await ping()
-    body = {
-        "status":   "ok" if db_ok else "degraded",
-        "uptime_s": int(time.time() - _START_TIME),
-        "database": {"ok": db_ok, "message": db_msg},
-        "pool":     await pool_status(),
-    }
-    return web.json_response(body, status=200 if db_ok else 503)
-
-
-async def start_health_server(host: str = "0.0.0.0", port: int = 8080) -> None:
+async def start_health_server(host="0.0.0.0", port=8080):
     global _runner
+    async def _health(req):
+        from .database import ping, pool_status
+        ok, msg = await ping()
+        return web.json_response({"status":"ok" if ok else "degraded",
+            "uptime_s":int(time.time()-_START_TIME),
+            "database":{"ok":ok,"message":msg},
+            "pool": await pool_status()}, status=200 if ok else 503)
     app = web.Application()
-    app.router.add_get("/health", _health_handler)
-    app.router.add_get("/ready",  lambda r: web.Response(text="ready"))
-    app.router.add_get("/",       _health_handler)
+    app.router.add_get("/health", _health)
+    app.router.add_get("/", _health)
+    app.router.add_get("/ready", lambda r: web.Response(text="ready"))
     _runner = web.AppRunner(app, access_log=None)
     await _runner.setup()
     await web.TCPSite(_runner, host, port).start()
-    logger.info("Health server: http://%s:%d/health", host, port)
+    logger.info("Health: http://%s:%d/health", host, port)
 
-
-async def stop_health_server() -> None:
+async def stop_health_server():
     global _runner
     if _runner:
-        await _runner.cleanup()
-        _runner = None
-        logger.info("Health server stopped.")
+        await _runner.cleanup(); _runner = None
 
 
-# ── /status command ───────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  Helpers
+# ══════════════════════════════════════════════════════════════════════════════
 
-async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/status — Admin-only system dashboard."""
-    from .database import ping, pool_status
+def _store(ctx): return ctx.application.bot_data["store"]
+def _adm(ctx):   return ctx.application.bot_data.setdefault("admin_state", dict(DEFAULT_ADMIN_STATE))
 
-    user     = update.effective_user
-    settings = context.application.bot_data.get("settings")
-    if settings and settings.admin_ids and (user is None or user.id not in settings.admin_ids):
-        await update.message.reply_text("⛔ Admin only.")
-        return
+def _user(update: Update, ctx) -> Optional[User]:
+    tg = update.effective_user
+    if not tg: return None
+    u, _ = _store(ctx).get_or_create_user(tg.id, tg.username or "", tg.first_name)
+    return u
 
-    await update.message.reply_text("⏳ Gathering stats…")
-
-    uptime_s   = int(time.time() - _START_TIME)
-    h, rem     = divmod(uptime_s, 3600)
-    m, s       = divmod(rem, 60)
-    uptime_str = f"{h}h {m}m {s}s"
-
+async def _edit(update: Update, text: str, kb=None):
+    q = update.callback_query
     try:
-        bi       = await context.bot.get_me()
-        bot_line = f"🤖 *{bi.first_name}* (@{bi.username})\n`ID: {bi.id}`"
-    except Exception as exc:
-        bot_line = f"⚠️ Bot info error: {exc}"
+        if q and q.message:
+            await q.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        else:
+            await update.effective_message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+    except BadRequest as e:
+        if "not modified" not in str(e).lower(): raise
 
-    db_ok, db_msg = await ping()
-    db_emoji      = "✅" if db_ok else "❌"
-    try:
-        pool = await pool_status()
-        pool_line = (
-            f"{db_emoji} DB: {db_msg}\n"
-            f"  Pool: {pool.get('checked_out',0)} active / "
-            f"{pool.get('checked_in',0)} idle / "
-            f"{pool.get('size',0)+pool.get('overflow',0)} total"
-        )
-    except Exception as exc:
-        pool_line = f"{db_emoji} DB error: {exc}"
+async def _answer(update: Update, text="", alert=False):
+    if update.callback_query:
+        await update.callback_query.answer(text, show_alert=alert)
 
-    store: Optional[Store] = context.application.bot_data.get("store")
-    store_line = (
-        f"👥 Users: {len(store.users)}\n"
-        f"🎮 Pending: {len(store.pending_games)}\n"
-        f"🏁 Completed: {len(store.active_games)}"
-    ) if store else "⚠️ Store not initialised"
-
-    tasks     = asyncio.all_tasks()
-    run_names = [t.get_name() for t in tasks if not t.done()]
-    bot_tasks = [n for n in run_names if any(kw in n.lower() for kw in ("monitor","health","mm_"))]
-    task_line = f"⚙️ Tasks: {len(run_names)} running ({len(bot_tasks)} bot-specific)"
-
-    try:
-        import psutil, os
-        mem_mb   = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
-        mem_line = f"🧠 Memory: {mem_mb:.1f} MB"
-    except ImportError:
-        mem_line = "🧠 Memory: install psutil for stats"
-
-    text = (
-        f"📊 *System Status*\n━━━━━━━━━━━━━━━━\n\n"
-        f"{bot_line}\n⏱️ Uptime: {uptime_str}\n\n"
-        f"*Database*\n{pool_line}\n\n"
-        f"*Game Store*\n{store_line}\n\n"
-        f"{task_line}\n{mem_line}"
-    )
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+def _back(data=CB_BACK_MAIN, label="⬅️ Back"):
+    return InlineKeyboardButton(label, callback_data=data)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Keyboards
 # ══════════════════════════════════════════════════════════════════════════════
 
-def main_menu_kb() -> InlineKeyboardMarkup:
+def main_menu_kb():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("💰 Wallet", callback_data=CB_MENU_WALLET),
-         InlineKeyboardButton("🎮 Play",   callback_data=CB_MENU_PLAY)],
-        [InlineKeyboardButton("🏆 Leaderboard", callback_data=CB_MENU_LEADERBOARD),
-         InlineKeyboardButton("❓ Help",         callback_data=CB_MENU_HELP)],
+        [InlineKeyboardButton("👤 Profile",  callback_data=CB_MENU_PROFILE),
+         InlineKeyboardButton("💰 Wallet",   callback_data=CB_MENU_WALLET)],
+        [InlineKeyboardButton("👥 Referral", callback_data=CB_MENU_REFERRAL),
+         InlineKeyboardButton("❓ Help",      callback_data=CB_MENU_HELP)],
     ])
 
-def back_to_main_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back to Menu", callback_data=CB_BACK_MAIN)]])
-
-def wallet_menu_kb() -> InlineKeyboardMarkup:
+def profile_kb():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📥 Deposit",  callback_data=CB_WALLET_DEPOSIT),
-         InlineKeyboardButton("📤 Withdraw", callback_data=CB_WALLET_WITHDRAW)],
-        [InlineKeyboardButton("🔄 Refresh",  callback_data=CB_WALLET_REFRESH)],
-        [InlineKeyboardButton("⬅️ Back",     callback_data=CB_BACK_MAIN)],
+        [InlineKeyboardButton("👥 Referral system",  callback_data=CB_PROFILE_REFERRAL)],
+        [InlineKeyboardButton("📋 Game history",     callback_data=CB_PROFILE_HISTORY)],
+        [InlineKeyboardButton("🏆 Top users",        callback_data=CB_PROFILE_LEADERBOARD)],
+        [InlineKeyboardButton("⚙️ Settings",         callback_data=CB_PROFILE_SETTINGS)],
+        [_back()],
     ])
 
-def deposit_network_kb() -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(net["label"], callback_data=f"{CB_LOBBY_NETWORK}{key}")]
-            for key, net in NETWORKS.items()]
+def wallet_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📥 Deposit",    callback_data=CB_WALLET_DEPOSIT),
+         InlineKeyboardButton("📤 Withdraw",   callback_data=CB_WALLET_WITHDRAW)],
+        [InlineKeyboardButton("💝 Tip user",   callback_data=CB_WALLET_TIP),
+         InlineKeyboardButton("🎟 Promo code", callback_data=CB_WALLET_PROMO)],
+        [InlineKeyboardButton("🔄 Refresh",    callback_data=CB_WALLET_REFRESH)],
+        [_back()],
+    ])
+
+def coin_grid_kb(action: str):
+    """Grid of all coins — 2 per row."""
+    items = list(COINS.items())
+    rows  = []
+    for i in range(0, len(items), 2):
+        row = []
+        for sym, info in items[i:i+2]:
+            row.append(InlineKeyboardButton(
+                f"{info['emoji']} {sym}",
+                callback_data=f"{CB_COIN_PREFIX}{action}:{sym}",
+            ))
+        rows.append(row)
     rows.append([InlineKeyboardButton("❌ Cancel", callback_data=CB_CANCEL)])
     return InlineKeyboardMarkup(rows)
 
-def withdraw_confirm_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Confirm", callback_data="withdraw:confirm"),
-        InlineKeyboardButton("❌ Cancel",  callback_data=CB_CANCEL),
-    ]])
-
-def game_type_kb() -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(info["label"], callback_data=f"{CB_LOBBY_GAME}{key}")]
-            for key, info in GAME_TYPES.items()]
-    rows.append([InlineKeyboardButton("⬅️ Back", callback_data=CB_BACK_MAIN)])
+def wager_kb():
+    btns = [InlineKeyboardButton(f"${w}", callback_data=f"{CB_WAGER_PREFIX}{w}") for w in PRESET_WAGERS]
+    rows = [btns[i:i+4] for i in range(0, len(btns), 4)]
+    rows.append([InlineKeyboardButton("✏️ Custom", callback_data=CB_WAGER_CUSTOM)])
+    rows.append([InlineKeyboardButton("❌ Cancel", callback_data=CB_CANCEL)])
     return InlineKeyboardMarkup(rows)
 
-def network_kb() -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(info["label"], callback_data=f"{CB_LOBBY_NETWORK}{key}")]
-            for key, info in NETWORKS.items()]
-    rows.append([InlineKeyboardButton("❌ Cancel", callback_data=CB_LOBBY_CANCEL)])
+def game_type_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎲 Dice",    callback_data=f"{CB_GAME_PREFIX}dice"),
+         InlineKeyboardButton("🎳 Bowling", callback_data=f"{CB_GAME_PREFIX}bowling")],
+        [InlineKeyboardButton("🎯 Darts",   callback_data=f"{CB_GAME_PREFIX}darts")],
+        [InlineKeyboardButton("❌ Cancel",  callback_data=CB_CANCEL)],
+    ])
+
+def game_mode_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Normal",       callback_data=f"{CB_MODE_PREFIX}normal"),
+         InlineKeyboardButton("Crazy 🤪",     callback_data=f"{CB_MODE_PREFIX}crazy")],
+        [InlineKeyboardButton("Double ×2",    callback_data=f"{CB_MODE_PREFIX}double"),
+         InlineKeyboardButton("Double Crazy", callback_data=f"{CB_MODE_PREFIX}double_crazy")],
+        [InlineKeyboardButton("❌ Cancel",    callback_data=CB_CANCEL)],
+    ])
+
+def join_game_kb(game_id: str):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⚔️ Join Game", callback_data=f"{CB_GAME_JOIN}{game_id}")],
+        [InlineKeyboardButton("❌ Cancel",    callback_data=f"{CB_GAME_CANCEL}:{game_id}")],
+    ])
+
+def admin_kb(adm: dict):
+    bot_s = "✅ ON" if adm.get("bot_betting_enabled") else "❌ OFF"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"🤖 Bot betting: {bot_s}", callback_data=CB_ADMIN_BOT_TOGGLE)],
+        [InlineKeyboardButton("📊 Stats & house balance",  callback_data=CB_ADMIN_STATS)],
+        [InlineKeyboardButton("🏦 House addresses",        callback_data=CB_ADMIN_HOUSE_ADDR)],
+        [InlineKeyboardButton("💸 Withdraw house funds",   callback_data="admin:house_withdraw")],
+        [InlineKeyboardButton("👥 Referral bonus",         callback_data=CB_ADMIN_REFERRAL_AMT)],
+        [InlineKeyboardButton("🎟 Add promo code",         callback_data=CB_ADMIN_ADD_PROMO)],
+        [InlineKeyboardButton("📋 List promos",            callback_data=CB_ADMIN_LIST_PROMOS)],
+        [InlineKeyboardButton("💝 Tip limits",             callback_data=CB_ADMIN_TIP_LIMITS)],
+    ])
+
+def preferred_coin_kb():
+    """Ask user which coin they want for withdrawals."""
+    items = list(COINS.items())
+    rows  = []
+    for i in range(0, len(items), 2):
+        row = []
+        for sym, info in items[i:i+2]:
+            row.append(InlineKeyboardButton(
+                f"{info['emoji']} {sym}",
+                callback_data=f"pref_coin:{sym}",
+            ))
+        rows.append(row)
     return InlineKeyboardMarkup(rows)
-
-def token_kb(network: str) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(f"{t['symbol']} — {t['name']}",
-                                  callback_data=f"{CB_LOBBY_TOKEN}{t['symbol']}")]
-            for t in TOKENS_BY_NETWORK.get(network, [])]
-    rows.append([InlineKeyboardButton("❌ Cancel", callback_data=CB_LOBBY_CANCEL)])
-    return InlineKeyboardMarkup(rows)
-
-def wager_kb() -> InlineKeyboardMarkup:
-    btns = [InlineKeyboardButton(f"${w}", callback_data=f"{CB_LOBBY_WAGER}{w}") for w in PRESET_WAGERS]
-    rows = [btns[i:i+3] for i in range(0, len(btns), 3)]
-    rows.append([InlineKeyboardButton("✏️ Custom amount", callback_data=CB_LOBBY_CUSTOM)])
-    rows.append([InlineKeyboardButton("❌ Cancel",        callback_data=CB_LOBBY_CANCEL)])
-    return InlineKeyboardMarkup(rows)
-
-def lobby_confirm_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Find Match", callback_data=CB_LOBBY_CONFIRM),
-        InlineKeyboardButton("❌ Cancel",     callback_data=CB_LOBBY_CANCEL),
-    ]])
-
-def matchmaking_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel Search", callback_data=CB_MATCH_CANCEL)]])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Handler helpers
+#  /start
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _store(context: ContextTypes.DEFAULT_TYPE) -> Store:
-    return context.application.bot_data["store"]
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    tg  = update.effective_user
+    sto = _store(ctx)
+    u, created = sto.get_or_create_user(tg.id, tg.username or "", tg.first_name)
 
-def _user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[User]:
-    tg = update.effective_user
-    if tg is None:
-        return None
-    u, _ = _store(context).get_or_create_user(tg.id, tg.username or "", tg.first_name)
-    return u
+    # Handle referral
+    args = ctx.args
+    if created and args:
+        try:
+            ref_id = int(args[0].replace("ref_",""))
+            if ref_id != tg.id:
+                referrer = sto.get_user(ref_id)
+                if referrer:
+                    u.referred_by = ref_id
+                    referrer.referral_count += 1
+                    bonus = _adm(ctx).get("referral_bonus", Decimal("0.50"))
+                    if bonus > 0:
+                        referrer.credit_usd(bonus)
+                        try:
+                            await ctx.bot.send_message(ref_id,
+                                f"👥 *Referral bonus!*\n{u.display_name()} joined via your link.\n"
+                                f"You earned *${bonus:.2f}*!",
+                                parse_mode=ParseMode.MARKDOWN)
+                        except TelegramError: pass
+        except (ValueError, AttributeError): pass
 
-def _lobby(context: ContextTypes.DEFAULT_TYPE) -> dict:
-    return context.user_data.setdefault("lobby", {})
-
-def _clear_lobby(context: ContextTypes.DEFAULT_TYPE) -> None:
-    context.user_data.pop("lobby", None)
-
-async def _edit(update: Update, text: str, kb=None, **kw) -> None:
-    q = update.callback_query
-    try:
-        if q and q.message:
-            await q.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN, **kw)
-        else:
-            await update.effective_message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN, **kw)
-    except BadRequest as e:
-        if "not modified" not in str(e).lower():
-            raise
-
-async def _answer(update: Update, text: str = "", alert: bool = False) -> None:
-    if update.callback_query:
-        await update.callback_query.answer(text, show_alert=alert)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  Command handlers
-# ══════════════════════════════════════════════════════════════════════════════
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    tg = update.effective_user
-    _, created = _store(context).get_or_create_user(tg.id, tg.username or "", tg.first_name)
     if created:
         text = (
-            f"👋 Welcome, *{tg.first_name}*!\n\n"
-            "You've been registered with a starter balance:\n"
-            "• 100 USDT on BNB Chain\n• 1 SOL on Solana\n\n"
-            "Use the menu below to play or manage your wallet."
+            f"🎮 *Welcome to Web3Bet, {tg.first_name}!*\n\n"
+            f"Play provably fair games in group chats.\n"
+            f"Bet in USD, pay out in any crypto!\n\n"
+            f"*How to play:*\n"
+            f"1. Deposit any crypto — balance shown in USD\n"
+            f"2. Add bot to a group chat\n"
+            f"3. /dice /bowl or /darts — set a USD wager\n"
+            f"4. Another player joins and you both roll\n"
+            f"5. Winner withdraws in any coin via swap!"
         )
-        logger.info("New user: %d @%s", tg.id, tg.username)
     else:
-        text = f"👋 Welcome back, *{tg.first_name}*!"
+        text = f"👋 Welcome back, *{tg.first_name}*!\n\nBalance: *${u.usd_balance:.2f}*"
+
     await update.message.reply_text(text, reply_markup=main_menu_kb(), parse_mode=ParseMode.MARKDOWN)
 
-async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    u    = _user(update, context)
-    text = f"🏠 *Main Menu*\nHello, {u.display_name() if u else 'there'}!"
-    if update.message:
-        await update.message.reply_text(text, reply_markup=main_menu_kb(), parse_mode=ParseMode.MARKDOWN)
-    else:
-        await _edit(update, text, main_menu_kb())
-
-async def wallet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    u = _user(update, context)
-    if not u:
-        await update.message.reply_text("Please /start first.")
-        return
-    lines = [f"• `{k.split(':')[0]}` — {v.amount:.4f} {v.token_symbol}" for k, v in u.balances.items()]
-    text  = "💰 *Wallet*\n\n" + ("\n".join(lines) if lines else "_No balances yet._")
-    await update.message.reply_text(text, reply_markup=wallet_menu_kb(), parse_mode=ParseMode.MARKDOWN)
-
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("Use the menu to navigate:", reply_markup=main_menu_kb())
-    await _show_help(update, context)
-
-async def cancel_conv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await _answer(update)
-    _clear_lobby(context)
-    await _edit(update, "❌ Cancelled.", main_menu_kb())
-    return ConversationHandler.END
-
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Menu callbacks
+#  Profile
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _answer(update)
-    data = update.callback_query.data
-    if data == CB_MENU_WALLET:
-        await _show_wallet(update, context)
-    elif data == CB_MENU_PLAY:
-        await _edit(update, "🎮 *Game Lobby*\n\nChoose a game:", game_type_kb())
-    elif data == CB_MENU_LEADERBOARD:
-        await _show_leaderboard(update, context)
-    elif data == CB_MENU_HELP:
-        await _show_help(update, context)
-    elif data == CB_BACK_MAIN:
-        u = _user(update, context)
-        await _edit(update, f"🏠 *Main Menu*\nHello, {u.display_name() if u else 'there'}!", main_menu_kb())
+async def _show_profile(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    u   = _user(update, ctx)
+    tg  = update.effective_user
+    reg = datetime.datetime.fromtimestamp(u.registered_at).strftime("%d.%m.%Y")
+    fav = GAME_TYPES.get(u.favourite_game,{}).get("label","—") if u.favourite_game else "—"
+    pref = u.preferred_coin if u.preferred_coin else "Not set"
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  Wallet conversation
-# ══════════════════════════════════════════════════════════════════════════════
-
-async def _show_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    u = _user(update, context)
-    if not u: return
-    lines = [f"  • `{k.split(':')[0]}` — {v.amount:.4f} {v.token_symbol}" for k, v in u.balances.items()]
-    bal_text = "\n".join(lines) if lines else "  _No balances yet — make a deposit!_"
     text = (
-        f"💰 *Your Wallet*\n\n*Balances:*\n{bal_text}\n\n"
-        f"*Stats:*\n  Games played: {u.games_played}\n"
-        f"  Wins: {u.games_won} ({u.win_rate:.1f}%)\n"
-        f"  Total wagered: {u.total_wagered:.2f}\n"
-        f"  Total won: {u.total_won:.2f}"
+        f"👤 *Profile*\n\n"
+        f"ℹ️ User: {u.display_name()} `({tg.id})`\n"
+        f"🎖 Rank: {u.rank}\n"
+        f"💵 Balance: *${u.usd_balance:.2f}*\n\n"
+        f"⚡ Total games: *{u.games_played}*\n"
+        f"💸 Total wagered: *${u.total_wagered:.2f}*\n"
+        f"🏆 Total won: *${u.total_won:.2f}*\n\n"
+        f"🎲 Favourite: {fav}\n"
+        f"🎉 Biggest win: *${u.biggest_win:.2f}*\n"
+        f"💳 Payout coin: *{pref}*\n\n"
+        f"📅 Registered: {reg}"
     )
-    await _edit(update, text, wallet_menu_kb())
+    await _edit(update, text, profile_kb())
 
-async def wallet_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+
+async def profile_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await _answer(update)
     data = update.callback_query.data
-    if data == CB_WALLET_REFRESH:
-        await _show_wallet(update, context); return ConversationHandler.END
-    if data == CB_WALLET_DEPOSIT:
-        await _edit(update, "📥 *Deposit*\n\nChoose a network:", deposit_network_kb())
-        return State.DEPOSIT_SELECT_NET
-    if data == CB_WALLET_WITHDRAW:
-        u = _user(update, context)
-        if not u or not u.balances:
-            await _answer(update, "❌ No balances to withdraw.", alert=True)
-            return ConversationHandler.END
-        rows = [[InlineKeyboardButton(
-            f"{k.split(':')[0]} — {v.amount:.4f} {v.token_symbol}",
-            callback_data=f"withdraw:select:{k}",
-        )] for k, v in u.balances.items() if v.amount > 0]
-        rows.append([InlineKeyboardButton("❌ Cancel", callback_data=CB_CANCEL)])
-        await _edit(update, "📤 *Withdraw*\n\nSelect balance:", InlineKeyboardMarkup(rows))
-        return State.WITHDRAW_ADDRESS
-    return ConversationHandler.END
 
-async def deposit_net_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if data == CB_MENU_PROFILE:
+        await _show_profile(update, ctx)
+
+    elif data == CB_PROFILE_REFERRAL:
+        u   = _user(update, ctx)
+        adm = _adm(ctx)
+        bot = await ctx.bot.get_me()
+        link  = f"https://t.me/{bot.username}?start=ref_{u.telegram_id}"
+        bonus = adm.get("referral_bonus", Decimal("0.50"))
+        await _edit(update,
+            f"👥 *Referral System*\n\nEarn *${bonus:.2f}* for every friend who joins!\n\n"
+            f"Your link:\n`{link}`\n\nReferrals: *{u.referral_count}*",
+            InlineKeyboardMarkup([[_back(CB_MENU_PROFILE,"⬅️ Back")]]))
+
+    elif data == CB_PROFILE_HISTORY:
+        u     = _user(update, ctx)
+        games = _store(ctx).get_games_for_user(u.telegram_id)
+        if not games:
+            text = "📋 *Game History*\n\n_No games yet._"
+        else:
+            lines = []
+            for g in games:
+                result = "🏆 Win" if g.winner_id==u.telegram_id else ("🤝 Tie" if g.winner_id is None else "💀 Loss")
+                score  = g.p1_score if g.creator_id==u.telegram_id else g.p2_score
+                lines.append(f"{GAME_TYPES[g.game_type.value]['emoji']} {result} — score {score} — ${g.wager_usd:.2f}")
+            text = "📋 *Game History (last 5)*\n\n" + "\n".join(lines)
+        await _edit(update, text, InlineKeyboardMarkup([[_back(CB_MENU_PROFILE,"⬅️ Back")]]))
+
+    elif data == CB_PROFILE_LEADERBOARD:
+        top = _store(ctx).leaderboard(10)
+        if not top:
+            text = "🏆 *Leaderboard*\n\n_No games yet!_"
+        else:
+            medals = ["🥇","🥈","🥉"]+[f"{i}." for i in range(4,11)]
+            rows   = [f"{medals[i]} {u.display_name()} — {u.games_won}W / {u.games_played}G ({u.win_rate:.0f}%)"
+                      for i,u in enumerate(top)]
+            text = "🏆 *Top Players*\n\n" + "\n".join(rows)
+        await _edit(update, text, InlineKeyboardMarkup([[_back(CB_MENU_PROFILE,"⬅️ Back")]]))
+
+    elif data == CB_PROFILE_SETTINGS:
+        u = _user(update, ctx)
+        await _edit(update,
+            f"⚙️ *Settings*\n\nPayout coin: *{u.preferred_coin or 'Not set'}*\n\nChange your preferred withdrawal coin:",
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton("💳 Change payout coin", callback_data="settings:change_coin")],
+                [_back(CB_MENU_PROFILE,"⬅️ Back")],
+            ]))
+
+    elif data == "settings:change_coin":
+        await _edit(update,
+            "💳 *Choose your preferred payout coin*\n\n"
+            "When you withdraw, your USD balance will be swapped to this coin via ChangeNow:",
+            preferred_coin_kb())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Preferred coin selection
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def pref_coin_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await _answer(update)
-    net_key  = update.callback_query.data.removeprefix("lobby:net:")
-    net_info = NETWORKS.get(net_key)
-    if not net_info:
-        await _answer(update, "Unknown network.", alert=True)
-        return State.DEPOSIT_SELECT_NET
-    demo = "0xDEMO_ADDRESS_REPLACE_WITH_WALLET_MANAGER"
-    if net_key == "SOLANA":
-        demo = "DEMO_SOL_ADDRESS_REPLACE_WITH_WALLET_MANAGER"
-    await _edit(
-        update,
-        f"📥 *Deposit on {net_info['label']}*\n\nSend to:\n`{demo}`\n\n"
-        "_Deposits credited after network confirmation._\n"
-        "⚠️ *Demo:* Wire `wallet.py` for real addresses.",
+    coin = update.callback_query.data.removeprefix("pref_coin:")
+    u    = _user(update, ctx)
+    if coin in COINS:
+        u.preferred_coin = coin
+        # If this was from the withdrawal flow, continue there
+        if ctx.user_data.get("withdraw_pending"):
+            ctx.user_data.pop("withdraw_pending")
+            await _start_withdrawal(update, ctx, u)
+            return
+        await _edit(update,
+            f"✅ Payout coin set to *{COINS[coin]['emoji']} {coin}*\n\n"
+            f"From now on, withdrawals will be swapped to {coin}.",
+            InlineKeyboardMarkup([[_back()]]))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Wallet
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def _show_wallet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    u = _user(update, ctx)
+    # Show coin holdings if any
+    holdings = ""
+    if u.coin_holdings:
+        lines = [f"  • {coin}: {amt:.6f}" for coin, amt in u.coin_holdings.items() if amt > 0]
+        if lines:
+            holdings = "\n\n*Deposited coins:*\n" + "\n".join(lines)
+    pref = u.preferred_coin if u.preferred_coin else "Not set (asked on first withdrawal)"
+    await _edit(update,
+        f"💰 *Your Wallet*\n\n"
+        f"💵 *Balance: ${u.usd_balance:.2f} USD*{holdings}\n\n"
+        f"💳 Payout coin: *{pref}*\n\n"
+        f"📊 {u.games_played} games · {u.games_won} wins",
+        wallet_kb())
+
+
+async def wallet_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await _answer(update)
+    data = update.callback_query.data
+    if data in (CB_MENU_WALLET, CB_WALLET_REFRESH):
+        await _show_wallet(update, ctx)
+    elif data == CB_WALLET_DEPOSIT:
+        await _edit(update, "📥 *Deposit*\n\nChoose a coin to deposit:", coin_grid_kb("deposit"))
+    elif data == CB_WALLET_WITHDRAW:
+        await _handle_withdraw_start(update, ctx)
+    elif data == CB_WALLET_TIP:
+        await _edit(update,
+            "💝 *Tip a User*\n\n`/tip @username amount`\n\nExample: `/tip @john 5`\n_(amount in USD)_",
+            InlineKeyboardMarkup([[_back(CB_MENU_WALLET,"⬅️ Back")]]))
+    elif data == CB_WALLET_PROMO:
+        await _edit(update,
+            "🎟 *Promo Code*\n\n`/promo YOURCODE`",
+            InlineKeyboardMarkup([[_back(CB_MENU_WALLET,"⬅️ Back")]]))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Deposit — real wallet generation
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def coin_selected(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await _answer(update)
+    data  = update.callback_query.data  # coin:deposit:ETH or coin:withdraw:ETH
+    parts = data.split(":")
+    if len(parts) < 3: return
+    action, sym = parts[1], parts[2]
+    if sym not in COINS:
+        await _answer(update,"Unknown coin.",alert=True); return
+
+    u    = _user(update, ctx)
+    coin = COINS[sym]
+    net  = coin["network"]
+
+    if action == "deposit":
+        # Generate real wallet if not already done for this coin
+        if sym not in u.deposit_addresses:
+            wm = ctx.application.bot_data.get("wallet_manager")
+            if wm:
+                try:
+                    info = await wm.generate_wallet(net)
+                    u.deposit_addresses[sym] = info.address
+                    u.deposit_keys[sym]      = info.encrypted_private_key
+                except Exception as exc:
+                    logger.error("Wallet gen %s failed: %s", sym, exc)
+                    await _edit(update,
+                        f"❌ Could not generate {sym} address.\nTry again later.",
+                        InlineKeyboardMarkup([[_back(CB_WALLET_DEPOSIT,"⬅️ Back")]]))
+                    return
+            else:
+                await _edit(update,
+                    "⚠️ *Wallet manager not connected.*",
+                    InlineKeyboardMarkup([[_back(CB_WALLET_DEPOSIT,"⬅️ Back")]]))
+                return
+
+        address   = u.deposit_addresses[sym]
+        net_label = NETWORKS[net]["label"]
+
+        await _edit(update,
+            f"📥 *Deposit {coin['emoji']} {sym}*\n\n"
+            f"Network: *{net_label}*\n\n"
+            f"↔️ *Send to:*\n`{address}`\n\n"
+            f"💵 Your balance updates in USD after confirmation.\n"
+            f"_Min deposit: any amount_",
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton("📋 Copy address", switch_inline_query=address)],
+                [_back(CB_WALLET_DEPOSIT,"⬅️ Back")],
+            ]))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Withdrawal — USD → chosen coin via ChangeNow swap
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def _handle_withdraw_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    u = _user(update, ctx)
+    if u.usd_balance <= 0:
+        await _answer(update, "❌ No balance to withdraw.", alert=True); return
+
+    if not u.preferred_coin:
+        # First time — ask preferred coin
+        ctx.user_data["withdraw_pending"] = True
+        await _edit(update,
+            f"💳 *First Withdrawal*\n\n"
+            f"Choose your preferred payout coin.\n"
+            f"Your *${u.usd_balance:.2f}* will be swapped to this coin via ChangeNow.\n\n"
+            f"You can change this anytime in Settings:",
+            preferred_coin_kb())
+    else:
+        await _start_withdrawal(update, ctx, u)
+
+
+async def _start_withdrawal(update: Update, ctx: ContextTypes.DEFAULT_TYPE, u: User):
+    coin = u.preferred_coin
+    await _edit(update,
+        f"📤 *Withdraw*\n\n"
+        f"Balance: *${u.usd_balance:.2f}*\n"
+        f"Payout coin: *{COINS[coin]['emoji']} {coin}*\n\n"
+        f"How much USD do you want to withdraw?\n"
+        f"_(or type 'all' to withdraw everything)_",
         InlineKeyboardMarkup([
-            [InlineKeyboardButton("⬅️ Back", callback_data=CB_WALLET_WITHDRAW)],
-            [InlineKeyboardButton("🏠 Menu", callback_data=CB_BACK_MAIN)],
-        ]),
-    )
-    return ConversationHandler.END
+            [InlineKeyboardButton("💯 Withdraw all", callback_data="withdraw:all")],
+            [InlineKeyboardButton("🔄 Change coin",  callback_data="withdraw:change_coin")],
+            [InlineKeyboardButton("❌ Cancel",        callback_data=CB_CANCEL)],
+        ]))
+    ctx.user_data["withdraw_step"] = "amount"
 
-async def withdraw_tok_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+
+async def withdraw_amount_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await _answer(update)
     data = update.callback_query.data
-    if data == CB_CANCEL:
-        await _show_wallet(update, context); return ConversationHandler.END
-    bk  = data.removeprefix("withdraw:select:")
-    net, tok = bk.split(":", 1)
-    context.user_data["withdraw_key"] = bk
-    u   = _user(update, context)
-    bal = u.get_balance(net, tok) if u else Decimal("0")
-    await _edit(update, f"📤 *Withdraw {tok} from {net}*\n\nAvailable: *{bal:.4f} {tok}*\n\nEnter destination address:",
-                InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=CB_CANCEL)]]))
-    return State.WITHDRAW_ADDRESS
+    u    = _user(update, ctx)
 
-async def withdraw_addr_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    addr = update.message.text.strip()
-    if len(addr) < 20:
-        await update.message.reply_text("❌ Invalid address. Try again:")
-        return State.WITHDRAW_ADDRESS
-    context.user_data["withdraw_address"] = addr
-    bk  = context.user_data.get("withdraw_key", "")
-    net, tok = bk.split(":", 1) if ":" in bk else ("?", "?")
-    u   = _user(update, context)
-    bal = u.get_balance(net, tok) if u else Decimal("0")
-    await update.message.reply_text(
-        f"💸 *Withdraw {tok}*\n\nTo: `{addr}`\nAvailable: {bal:.4f} {tok}\n\nEnter amount:",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=CB_CANCEL)]]),
-        parse_mode=ParseMode.MARKDOWN,
-    )
-    return State.WITHDRAW_AMOUNT
+    if data == "withdraw:all":
+        ctx.user_data["withdraw_usd"] = str(u.usd_balance)
+        await _ask_withdraw_address(update, ctx, u)
+    elif data == "withdraw:change_coin":
+        await _edit(update,
+            "💳 *Change payout coin:*",
+            preferred_coin_kb())
+        ctx.user_data["withdraw_pending"] = True
 
-async def withdraw_amt_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+
+async def withdraw_amount_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    if ctx.user_data.get("withdraw_step") != "amount":
+        return ConversationHandler.END
     try:
         amount = Decimal(update.message.text.strip())
     except InvalidOperation:
-        await update.message.reply_text("❌ Invalid number. Try again:"); return State.WITHDRAW_AMOUNT
-    bk  = context.user_data.get("withdraw_key", "")
-    net, tok = bk.split(":", 1) if ":" in bk else ("?","?")
-    u   = _user(update, context)
-    avl = u.get_balance(net, tok) if u else Decimal("0")
-    if amount <= 0:
-        await update.message.reply_text("❌ Amount must be positive."); return State.WITHDRAW_AMOUNT
-    if amount > avl:
-        await update.message.reply_text(f"❌ Insufficient. Have {avl:.4f} {tok}."); return State.WITHDRAW_AMOUNT
-    context.user_data["withdraw_amount"] = str(amount)
-    addr = context.user_data.get("withdraw_address", "")
-    await update.message.reply_text(
-        f"📋 *Confirm Withdrawal*\n\nNetwork: *{net}*\nToken: *{tok}*\nAmount: *{amount:.4f} {tok}*\nTo: `{addr}`\n\nProceed?",
-        reply_markup=withdraw_confirm_kb(), parse_mode=ParseMode.MARKDOWN,
+        await update.message.reply_text("❌ Invalid amount. Enter a number or 'all':"); return State.WITHDRAW_AMOUNT
+    u = _user(update, ctx)
+    if amount <= 0 or amount > u.usd_balance:
+        await update.message.reply_text(f"❌ Must be between $0.01 and ${u.usd_balance:.2f}."); return State.WITHDRAW_AMOUNT
+    ctx.user_data["withdraw_usd"] = str(amount)
+    await _ask_withdraw_address(update, ctx, u, from_message=True)
+    return State.WITHDRAW_ADDRESS
+
+
+async def _ask_withdraw_address(update, ctx, u: User, from_message=False):
+    coin   = u.preferred_coin
+    amount = Decimal(ctx.user_data.get("withdraw_usd","0"))
+
+    # Get swap estimate
+    estimate_text = "_(fetching estimate…)_"
+    pf = swap_module.price_feed
+    cn = swap_module.changenow
+    if pf and cn:
+        try:
+            price = await pf.get_price(coin)
+            if price:
+                raw_coin_amount = (amount / price).quantize(Decimal("0.00000001"))
+                est = await cn.estimate("USDT", coin, raw_coin_amount)
+                if est:
+                    estimate_text = f"≈ *{est.to_amount:.6f} {coin}*"
+                else:
+                    estimate_text = f"≈ *{raw_coin_amount:.6f} {coin}* _(direct estimate)_"
+        except Exception as exc:
+            logger.warning("Estimate error: %s", exc)
+
+    ctx.user_data["withdraw_step"] = "address"
+    text = (
+        f"📤 *Withdraw ${amount:.2f}*\n\n"
+        f"Coin: *{COINS[coin]['emoji']} {coin}*\n"
+        f"You receive: {estimate_text}\n\n"
+        f"Enter your *{coin}* wallet address:"
     )
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=CB_CANCEL)]])
+    if from_message:
+        await update.message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+    else:
+        await _edit(update, text, kb)
+
+
+async def withdraw_address_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    if ctx.user_data.get("withdraw_step") != "address":
+        return ConversationHandler.END
+    addr = update.message.text.strip()
+    if len(addr) < 20:
+        await update.message.reply_text("❌ Invalid address. Try again:"); return State.WITHDRAW_ADDRESS
+
+    u      = _user(update, ctx)
+    coin   = u.preferred_coin
+    amount = Decimal(ctx.user_data.get("withdraw_usd","0"))
+
+    ctx.user_data["withdraw_address"] = addr
+    ctx.user_data["withdraw_step"]    = "confirm"
+
+    # Final estimate
+    estimate_text = "calculating…"
+    pf = swap_module.price_feed
+    cn = swap_module.changenow
+    if pf and cn:
+        try:
+            price = await pf.get_price(coin)
+            if price:
+                raw = (amount / price).quantize(Decimal("0.00000001"))
+                est = await cn.estimate("USDT", coin, raw)
+                if est: estimate_text = f"{est.to_amount:.6f} {coin}"
+                else:   estimate_text = f"~{raw:.6f} {coin}"
+        except Exception: pass
+
+    await update.message.reply_text(
+        f"📋 *Confirm Withdrawal*\n\n"
+        f"Amount: *${amount:.2f} USD*\n"
+        f"Receive: *{estimate_text}*\n"
+        f"To: `{addr}`\n"
+        f"Via: ChangeNow swap\n\n"
+        f"⚠️ _Swap rate is live — final amount may vary slightly_",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Confirm", callback_data="withdraw:confirm"),
+             InlineKeyboardButton("❌ Cancel",  callback_data=CB_CANCEL)],
+        ]),
+        parse_mode=ParseMode.MARKDOWN)
     return State.WITHDRAW_CONFIRM
 
-async def withdraw_confirmed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+
+async def withdraw_confirmed(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     await _answer(update)
     if update.callback_query.data == CB_CANCEL:
-        await _show_wallet(update, context); return ConversationHandler.END
-    u   = _user(update, context)
-    bk  = context.user_data.get("withdraw_key", "")
-    net, tok = bk.split(":", 1) if ":" in bk else ("?","?")
-    amt  = Decimal(context.user_data.get("withdraw_amount", "0"))
-    addr = context.user_data.get("withdraw_address", "")
-    if u and u.deduct_balance(net, tok, amt):
-        logger.info("Withdrawal: user=%d %s %s → %s", u.telegram_id, amt, tok, addr)
-        await _edit(update,
-            f"✅ *Withdrawal submitted!*\n\n*{amt:.4f} {tok}* from {net}\n→ `{addr}`\n\n"
-            "_Connect `wallet.py` to broadcast on-chain._",
-            back_to_main_kb())
-    else:
-        await _edit(update, "❌ Insufficient funds.", back_to_main_kb())
-    for k in ("withdraw_key", "withdraw_address", "withdraw_amount"):
-        context.user_data.pop(k, None)
+        await _show_wallet(update, ctx); return ConversationHandler.END
+
+    u      = _user(update, ctx)
+    coin   = u.preferred_coin
+    amount = Decimal(ctx.user_data.get("withdraw_usd","0"))
+    addr   = ctx.user_data.get("withdraw_address","")
+
+    if not u.debit_usd(amount):
+        await _edit(update,"❌ Insufficient balance.",wallet_kb()); return ConversationHandler.END
+
+    await _edit(update,
+        f"⏳ *Processing withdrawal…*\n\n"
+        f"Swapping ${amount:.2f} → {coin}\n"
+        f"To: `{addr}`\n\n"
+        f"_You'll be notified when complete._",
+        None)
+
+    # Run swap in background
+    asyncio.create_task(_execute_swap(ctx, u, coin, amount, addr))
+
+    for k in ("withdraw_usd","withdraw_address","withdraw_step"):
+        ctx.user_data.pop(k, None)
     return ConversationHandler.END
 
 
+async def _execute_swap(ctx, u: User, coin: str, usd_amount: Decimal, to_addr: str):
+    """Background task: execute ChangeNow swap and send to user."""
+    cn = swap_module.changenow
+    pf = swap_module.price_feed
+
+    if not cn or not pf:
+        await ctx.bot.send_message(u.telegram_id,
+            f"❌ Swap service unavailable. Your ${usd_amount:.2f} has been refunded.",
+            parse_mode=ParseMode.MARKDOWN)
+        u.credit_usd(usd_amount)
+        return
+
+    try:
+        # Convert USD to USDT amount for swap input
+        usdt_price = await pf.get_price("USDT")
+        from_amount = (usd_amount / (usdt_price or Decimal("1"))).quantize(Decimal("0.01"))
+
+        # Create ChangeNow exchange: USDT → coin
+        # House USDT address is the refund address
+        house_addr = _adm_state_global.get("house_addresses",{}).get("bsc","") if _adm_state_global else ""
+        tx = await cn.create_exchange("USDT", coin, from_amount, to_addr, refund_addr=house_addr or None)
+
+        if not tx:
+            await ctx.bot.send_message(u.telegram_id,
+                f"❌ Swap failed. Your ${usd_amount:.2f} has been refunded.")
+            u.credit_usd(usd_amount)
+            return
+
+        await ctx.bot.send_message(u.telegram_id,
+            f"✅ *Swap created!*\n\n"
+            f"Exchange ID: `{tx.exchange_id}`\n"
+            f"Send: {tx.deposit_amount} USDT → {tx.deposit_address}\n"
+            f"You receive: ~{tx.to_amount:.6f} {coin}\n"
+            f"To: `{to_addr}`\n\n"
+            f"_ChangeNow is processing your swap. This usually takes 5-30 minutes._",
+            parse_mode=ParseMode.MARKDOWN)
+
+        # Poll for completion
+        for _ in range(60):
+            await asyncio.sleep(30)
+            status = await cn.get_status(tx.exchange_id)
+            if status == "finished":
+                await ctx.bot.send_message(u.telegram_id,
+                    f"🎉 *Withdrawal complete!*\n\n"
+                    f"{tx.to_amount:.6f} {coin} sent to `{to_addr}`",
+                    parse_mode=ParseMode.MARKDOWN)
+                return
+            if status == "failed":
+                u.credit_usd(usd_amount)
+                await ctx.bot.send_message(u.telegram_id,
+                    f"❌ Swap failed. Your ${usd_amount:.2f} has been refunded.")
+                return
+
+    except Exception as exc:
+        logger.error("Swap execution error: %s", exc)
+        u.credit_usd(usd_amount)
+        await ctx.bot.send_message(u.telegram_id,
+            f"❌ Error processing swap. Your ${usd_amount:.2f} has been refunded.")
+
+_adm_state_global: dict = {}  # set in post_init
+
+
 # ══════════════════════════════════════════════════════════════════════════════
-#  Game lobby conversation
+#  Tip & Promo
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def play_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await _answer(update)
-    _clear_lobby(context)
-    await _edit(update, "🎮 *Game Lobby*\n\nWhat game would you like to play?", game_type_kb())
-    return State.LOBBY_GAME_TYPE
+async def tip_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    args = ctx.args
+    if not args or len(args) < 2:
+        await update.message.reply_text("Usage: `/tip @username amount`\nExample: `/tip @john 5`",
+                                        parse_mode=ParseMode.MARKDOWN); return
+    name = args[0].lstrip("@")
+    try: amount = Decimal(args[1])
+    except InvalidOperation:
+        await update.message.reply_text("❌ Invalid amount."); return
 
-async def lobby_game_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await _answer(update)
-    key = update.callback_query.data.removeprefix(CB_LOBBY_GAME)
-    if key not in GAME_TYPES:
-        await _answer(update, "Unknown game.", alert=True); return State.LOBBY_GAME_TYPE
-    _lobby(context)["game_type"] = key
-    info = GAME_TYPES[key]
-    await _edit(update, f"{info['label']}\n_{info['description']}_\n\nChoose a network:", network_kb())
-    return State.LOBBY_NETWORK
+    adm = _adm(ctx)
+    if amount < adm.get("tip_min", Decimal("0.01")) or amount > adm.get("tip_max", Decimal("100")):
+        await update.message.reply_text(f"❌ Tip must be ${adm['tip_min']} – ${adm['tip_max']}."); return
 
-async def lobby_network(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await _answer(update)
-    net = update.callback_query.data.removeprefix(CB_LOBBY_NETWORK)
-    if net not in NETWORKS:
-        await _answer(update, "Unknown network.", alert=True); return State.LOBBY_NETWORK
-    _lobby(context)["network"] = net
-    await _edit(update, f"Network: *{NETWORKS[net]['label']}*\n\nChoose a token:", token_kb(net))
-    return State.LOBBY_TOKEN
+    sender = _user(update, ctx)
+    sto    = _store(ctx)
+    target = next((u for u in sto.users.values() if u.username.lower()==name.lower()), None)
+    if not target:
+        await update.message.reply_text(f"❌ @{name} not found."); return
+    if target.telegram_id == sender.telegram_id:
+        await update.message.reply_text("❌ Can't tip yourself."); return
 
-async def lobby_token(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await _answer(update)
-    sym = update.callback_query.data.removeprefix(CB_LOBBY_TOKEN)
-    net = _lobby(context).get("network", "")
-    if sym not in [t["symbol"] for t in TOKENS_BY_NETWORK.get(net, [])]:
-        await _answer(update, "Invalid token.", alert=True); return State.LOBBY_TOKEN
-    _lobby(context)["token"] = sym
-    await _edit(update, f"Token: *{sym}* on *{NETWORKS[net]['label']}*\n\nSelect your wager:", wager_kb())
-    return State.LOBBY_WAGER
+    if not sender.debit_usd(amount):
+        await update.message.reply_text(f"❌ Insufficient balance. You have ${sender.usd_balance:.2f}."); return
 
-async def lobby_wager(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    target.credit_usd(amount)
+    await update.message.reply_text(f"💝 *Tipped ${amount:.2f} to @{target.username}!*",
+                                    parse_mode=ParseMode.MARKDOWN)
+    try:
+        await ctx.bot.send_message(target.telegram_id,
+            f"💝 *You received a tip!*\n\n${amount:.2f} from {sender.display_name()}",
+            parse_mode=ParseMode.MARKDOWN)
+    except TelegramError: pass
+
+
+async def promo_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    args = ctx.args
+    if not args:
+        await update.message.reply_text("Usage: `/promo YOURCODE`", parse_mode=ParseMode.MARKDOWN); return
+    code = args[0].upper()
+    u    = _user(update, ctx)
+    adm  = _adm(ctx)
+    codes = adm.get("promo_codes", {})
+    if code in u.used_promos:
+        await update.message.reply_text("❌ Already used this code."); return
+    if code not in codes or codes[code].get("uses_left",0) <= 0:
+        await update.message.reply_text("❌ Invalid or expired code."); return
+    bonus = Decimal(str(codes[code]["bonus"]))
+    u.credit_usd(bonus)
+    u.used_promos.append(code)
+    codes[code]["uses_left"] -= 1
+    await update.message.reply_text(f"🎟 *${bonus:.2f} added to your balance!*",
+                                    parse_mode=ParseMode.MARKDOWN)
+
+
+async def referral_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await _answer(update)
+    u   = _user(update, ctx)
+    adm = _adm(ctx)
+    bot = await ctx.bot.get_me()
+    link  = f"https://t.me/{bot.username}?start=ref_{u.telegram_id}"
+    bonus = adm.get("referral_bonus", Decimal("0.50"))
+    await _edit(update,
+        f"👥 *Referral System*\n\nEarn *${bonus:.2f}* per friend!\n\n`{link}`\n\nReferrals: *{u.referral_count}*",
+        InlineKeyboardMarkup([[_back()]]))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Group games
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def _start_game_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE, game_type: str):
+    if update.effective_chat.type == "private":
+        await update.message.reply_text("🎮 Add this bot to a group to play!"); return
+    if _store(ctx).get_game_for_chat(update.effective_chat.id):
+        await update.message.reply_text("⚠️ A game is already running here!"); return
+    ctx.user_data["new_game_type"] = game_type
+    await update.message.reply_text(
+        f"{GAME_TYPES[game_type]['emoji']} *{GAME_TYPES[game_type]['label']}*\n\nChoose mode:",
+        reply_markup=game_mode_kb(), parse_mode=ParseMode.MARKDOWN)
+
+async def dice_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await _start_game_cmd(update, ctx, "dice")
+async def bowl_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await _start_game_cmd(update, ctx, "bowling")
+async def darts_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await _start_game_cmd(update, ctx, "darts")
+
+
+async def game_mode_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await _answer(update)
+    mode = update.callback_query.data.removeprefix(CB_MODE_PREFIX)
+    ctx.user_data["new_game_mode"] = mode
+    await _edit(update,
+        f"Mode: *{GAME_MODES[mode]['label']}*\n\nSet your USD wager:",
+        wager_kb())
+
+
+async def game_wager_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await _answer(update)
     data = update.callback_query.data
-    if data == CB_LOBBY_CUSTOM:
-        await _edit(update, f"✏️ Enter wager amount (min {MIN_WAGER}, max {MAX_WAGER}):",
-                    InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=CB_LOBBY_CANCEL)]]))
-        return State.LOBBY_WAGER
-    return await _set_wager(update, context, data.removeprefix(CB_LOBBY_WAGER))
-
-async def lobby_wager_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    return await _set_wager(update, context, update.message.text.strip(), from_msg=True)
-
-async def _set_wager(
-    update: Update, context: ContextTypes.DEFAULT_TYPE,
-    amount_str: str, from_msg: bool = False,
-) -> int:
-    try:
-        amount = Decimal(amount_str)
-    except InvalidOperation:
-        if from_msg: await update.message.reply_text("❌ Invalid number:")
-        return State.LOBBY_WAGER
-    if amount < MIN_WAGER or amount > MAX_WAGER:
-        msg = f"❌ Wager must be {MIN_WAGER}–{MAX_WAGER}."
-        if from_msg: await update.message.reply_text(msg)
-        else: await _answer(update, msg, alert=True)
-        return State.LOBBY_WAGER
-    u   = _user(update, context)
-    lob = _lobby(context)
-    net = lob.get("network",""); tok = lob.get("token","")
-    if u and u.get_balance(net, tok) < amount:
-        msg = f"❌ Insufficient {tok}. Have {u.get_balance(net,tok):.4f}."
-        if from_msg: await update.message.reply_text(msg)
-        else: await _answer(update, msg, alert=True)
-        return State.LOBBY_WAGER
-    lob["wager"] = str(amount)
-    game_info = GAME_TYPES.get(lob.get("game_type",""), {})
-    summary = (
-        f"📋 *Game Summary*\n\n"
-        f"Game:    *{game_info.get('label','')}*\n"
-        f"Network: *{NETWORKS.get(net,{}).get('label',net)}*\n"
-        f"Token:   *{tok}*\nWager:   *{amount} {tok}*\n"
-        f"To win:  *~{amount * 2 * Decimal('0.95'):.4f} {tok}* _(5% fee)_\n\nFind a match?"
-    )
-    if from_msg: await update.message.reply_text(summary, reply_markup=lobby_confirm_kb(), parse_mode=ParseMode.MARKDOWN)
-    else: await _edit(update, summary, lobby_confirm_kb())
-    return State.LOBBY_CONFIRM
-
-async def lobby_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await _answer(update)
-    if update.callback_query.data == CB_LOBBY_CANCEL:
-        await _edit(update, "❌ Game cancelled.", main_menu_kb())
-        _clear_lobby(context); return ConversationHandler.END
-    u   = _user(update, context)
-    lob = _lobby(context)
-    sto = _store(context)
-    if sto.get_pending_for_player(u.telegram_id):
-        await _answer(update, "⚠️ Already in queue!", alert=True); return ConversationHandler.END
-    net = lob["network"]; tok = lob["token"]; amt = Decimal(lob["wager"])
-    if not u.deduct_balance(net, tok, amt):
-        await _answer(update, "❌ Insufficient balance.", alert=True); return ConversationHandler.END
-    pending = PendingGame(
-        player_id=u.telegram_id, game_type=GameType(lob["game_type"]),
-        network=net, token_symbol=tok, wager_amount=amt,
-    )
-    context.user_data["pending_game_id"] = pending.game_id
-    matched = sto.enqueue(pending)
-    if matched:
-        await _edit(update, "⚡ *Opponent found!* Resolving…", None)
-        await _run_game(update, context, pending, matched)
-    else:
-        await _edit(update,
-            f"🔍 *Searching for opponent…*\n\nGame: *{GAME_TYPES[lob['game_type']]['label']}*\n"
-            f"Wager: *{amt} {tok}* on *{net}*\n\n_Queue: 1 — you'll be notified!_",
-            matchmaking_kb())
-        context.job_queue.run_once(
-            _matchmaking_timeout, when=MATCHMAKING_TTL,
-            data={"game_id": pending.game_id, "user_id": u.telegram_id,
-                  "network": net, "token": tok, "amount": str(amt)},
-            name=f"mm_{pending.game_id}", chat_id=update.effective_chat.id, user_id=u.telegram_id,
-        )
-    _clear_lobby(context); return ConversationHandler.END
-
-async def match_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _answer(update)
-    u   = _user(update, context)
-    sto = _store(context)
-    gid = context.user_data.pop("pending_game_id", None)
-    if not gid:
-        await _answer(update, "No active search.", alert=True); return
-    pending = sto.dequeue(gid)
-    if pending:
-        u.add_balance(pending.network, pending.token_symbol, pending.wager_amount)
-        await _edit(update, f"✅ Cancelled.\n*{pending.wager_amount} {pending.token_symbol}* refunded.", main_menu_kb())
-        logger.info("Matchmaking cancelled: user=%d game=%s", u.telegram_id, gid[:8])
-    else:
-        await _edit(update, "⚠️ Queue entry not found.", main_menu_kb())
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  Game resolution
-# ══════════════════════════════════════════════════════════════════════════════
-
-async def _run_game(
-    update: Update, context: ContextTypes.DEFAULT_TYPE,
-    p1: PendingGame, p2: PendingGame,
-) -> None:
-    sto  = _store(context)
-    game = ActiveGame(
-        game_id=str(uuid.uuid4()), game_type=p1.game_type,
-        network=p1.network, token_symbol=p1.token_symbol, wager_amount=p1.wager_amount,
-        player1_id=p1.player_id, player2_id=p2.player_id,
-    )
-    game = resolve_game(game)
-    sto.active_games[game.game_id] = game
-
-    u1 = sto.get_user(p1.player_id)
-    u2 = sto.get_user(p2.player_id)
-    net = game.network; tok = game.token_symbol
-
-    if game.winner_id is None:
-        if u1: u1.add_balance(net, tok, game.winner_payout)
-        if u2: u2.add_balance(net, tok, game.winner_payout)
-    elif game.winner_id == p1.player_id:
-        if u1: u1.add_balance(net, tok, game.winner_payout)
-    else:
-        if u2: u2.add_balance(net, tok, game.winner_payout)
-
-    for pid, u in ((p1.player_id, u1), (p2.player_id, u2)):
-        if u:
-            u.games_played += 1; u.total_wagered += game.wager_amount
-            if game.winner_id == pid:
-                u.games_won += 1; u.total_won += game.winner_payout
-            elif game.winner_id is None:
-                u.total_won += game.winner_payout
-
-    logger.info("Game resolved: %s p1=%d(%d) p2=%d(%d) winner=%s",
-                game.game_id[:8], p1.player_id, game.player1_score,
-                p2.player_id, game.player2_score, game.winner_id)
-
-    await _edit(update, game_result_text(game, p1.player_id), main_menu_kb())
-    try:
-        await context.bot.send_message(
-            chat_id=p2.player_id,
-            text=f"⚡ *Match found!*\n\n{game_result_text(game, p2.player_id)}",
-            reply_markup=main_menu_kb(), parse_mode=ParseMode.MARKDOWN,
-        )
-    except (Forbidden, TelegramError) as exc:
-        logger.warning("Could not notify player %d: %s", p2.player_id, exc)
-
-
-async def _matchmaking_timeout(context: ContextTypes.DEFAULT_TYPE) -> None:
-    data = context.job.data
-    gid  = data["game_id"]; uid = data["user_id"]
-    sto  = context.application.bot_data["store"]
-    pending = sto.dequeue(gid)
-    if not pending: return
-    u = sto.get_user(uid)
-    if u: u.add_balance(data["network"], data["token"], Decimal(data["amount"]))
-    try:
-        await context.bot.send_message(
-            chat_id=uid,
-            text=(f"⏰ *Matchmaking timed out.*\n\nNo opponent after {MATCHMAKING_TTL//60}m.\n"
-                  f"*{data['amount']} {data['token']}* refunded."),
-            reply_markup=main_menu_kb(), parse_mode=ParseMode.MARKDOWN,
-        )
-    except TelegramError as exc:
-        logger.warning("Timeout notify failed user=%d: %s", uid, exc)
-    logger.info("Matchmaking timeout: user=%d game=%s", uid, gid[:8])
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  Leaderboard / Help / Error handler
-# ══════════════════════════════════════════════════════════════════════════════
-
-async def _show_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    top = _store(context).leaderboard(10)
-    if not top:
-        text = "🏆 *Leaderboard*\n\n_No games yet. Be the first!_"
-    else:
-        medals = ["🥇","🥈","🥉"] + ["4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"]
-        rows   = [f"{medals[i] if i < len(medals) else str(i+1)+'.'} "
-                  f"{'@'+u.username if u.username else u.first_name} — "
-                  f"{u.games_won}W/{u.games_played}G ({u.win_rate:.0f}%)"
-                  for i, u in enumerate(top)]
-        text = "🏆 *Leaderboard — Top Players*\n\n" + "\n".join(rows)
-    await _edit(update, text, back_to_main_kb())
-
-async def _show_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _edit(update, (
-        "❓ *Help & How to Play*\n\n"
-        "*Games*\n🎲 *Dice* — Roll 1–6. Highest wins.\n"
-        "🎳 *Bowling* — Score 0–300. Highest wins.\n\n"
-        "*Matchmaking*\n• Set wager → wait for opponent → instant resolve.\n"
-        "• 5-min timeout if no match — wager refunded.\n\n"
-        "*Fees*\n• 5% rake · Winner gets 95% of pool.\n"
-        "• Tie: each gets 47.5% back.\n\n"
-        "*Commands*\n/start /menu /wallet /help /cancel"
-    ), back_to_main_kb())
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.error("Handler exception:", exc_info=context.error)
-    if isinstance(context.error, Forbidden):
+    if data == CB_WAGER_CUSTOM:
+        await _edit(update, "✏️ Enter wager in USD (e.g. `2.50`):",
+                    InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=CB_CANCEL)]]))
+        ctx.user_data["awaiting_wager"] = True
         return
+    amount_str = data.removeprefix(CB_WAGER_PREFIX)
+    await _create_lobby(update, ctx, amount_str)
+
+
+async def game_wager_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.user_data.get("awaiting_wager"): return
+    ctx.user_data.pop("awaiting_wager")
+    await _create_lobby(update, ctx, update.message.text.strip(), True)
+
+
+async def _create_lobby(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
+                         amount_str: str, from_msg=False):
+    try: amount = Decimal(amount_str)
+    except InvalidOperation:
+        msg = "❌ Invalid amount."
+        if from_msg: await update.message.reply_text(msg)
+        else: await _answer(update, msg, alert=True)
+        return
+
+    if amount < MIN_WAGER or amount > MAX_WAGER:
+        msg = f"❌ Must be ${MIN_WAGER}–${MAX_WAGER}."
+        if from_msg: await update.message.reply_text(msg)
+        else: await _answer(update, msg, alert=True)
+        return
+
+    tg  = update.effective_user
+    u   = _user(update, ctx)
+    if not u.debit_usd(amount):
+        msg = f"❌ Insufficient. Balance: ${u.usd_balance:.2f}"
+        if from_msg: await update.message.reply_text(msg)
+        else: await _answer(update, msg, alert=True)
+        return
+
+    game = GroupGame(
+        game_id    = str(uuid.uuid4()),
+        chat_id    = update.effective_chat.id,
+        message_id = 0,
+        game_type  = GameType(ctx.user_data.get("new_game_type","dice")),
+        game_mode  = GameMode(ctx.user_data.get("new_game_mode","normal")),
+        wager_usd  = amount,
+        creator_id  = tg.id,
+        creator_name = u.display_name(),
+    )
+    _store(ctx).add_game(game)
+
+    if from_msg:
+        msg = await update.message.reply_text(
+            lobby_text(game), reply_markup=join_game_kb(game.game_id),
+            parse_mode=ParseMode.MARKDOWN)
+    else:
+        msg = await ctx.bot.send_message(
+            update.effective_chat.id, lobby_text(game),
+            reply_markup=join_game_kb(game.game_id),
+            parse_mode=ParseMode.MARKDOWN)
+    game.message_id = msg.message_id
+
+    ctx.job_queue.run_once(
+        _join_timeout,
+        when=cfg.game_join_timeout,
+        data={"game_id":game.game_id,"chat_id":game.chat_id,
+              "creator_id":game.creator_id,"amount":str(amount),
+              "message_id":msg.message_id},
+        name=f"join_{game.game_id}", chat_id=game.chat_id)
+
+    for k in ("new_game_type","new_game_mode"):
+        ctx.user_data.pop(k,None)
+
+
+async def join_game_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await _answer(update)
+    game_id = update.callback_query.data.removeprefix(CB_GAME_JOIN)
+    sto     = _store(ctx)
+    game    = sto.get_game(game_id)
+    if not game or game.status != GameStatus.WAITING:
+        await _answer(update,"❌ Game not found or started.",alert=True); return
+    tg = update.effective_user
+    if tg.id == game.creator_id:
+        await _answer(update,"❌ Can't join your own game!",alert=True); return
+    u = _user(update, ctx)
+    if not u.debit_usd(game.wager_usd):
+        await _answer(update,f"❌ Need ${game.wager_usd:.2f}. You have ${u.usd_balance:.2f}.",alert=True); return
+
+    game.joiner_id   = tg.id
+    game.joiner_name = u.display_name()
+    game.status      = GameStatus.ACTIVE
+
+    for job in ctx.job_queue.get_jobs_by_name(f"join_{game_id}"):
+        job.schedule_removal()
+
+    try:
+        await ctx.bot.edit_message_text(active_text(game),
+            chat_id=game.chat_id, message_id=game.message_id,
+            parse_mode=ParseMode.MARKDOWN)
+    except TelegramError: pass
+
+    await ctx.bot.send_message(game.chat_id,
+        f"⚔️ *{game.creator_name}* vs *{game.joiner_name}*\n\n"
+        f"Send {game.emoji} to roll! Each needs *{game.rolls_per_player}* roll(s).",
+        parse_mode=ParseMode.MARKDOWN)
+
+
+async def cancel_game_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await _answer(update)
+    game_id = update.callback_query.data.split(":")[-1]
+    sto     = _store(ctx)
+    game    = sto.get_game(game_id)
+    if not game: return
+    if update.effective_user.id != game.creator_id:
+        await _answer(update,"Only creator can cancel.",alert=True); return
+    if game.status != GameStatus.WAITING: return
+    u = _user(update, ctx)
+    u.credit_usd(game.wager_usd)
+    game.status = GameStatus.CANCELLED
+    sto.remove_game(game_id)
+    for job in ctx.job_queue.get_jobs_by_name(f"join_{game_id}"):
+        job.schedule_removal()
+    try:
+        await ctx.bot.edit_message_text("❌ Game cancelled. Wager refunded.",
+            chat_id=game.chat_id, message_id=game.message_id)
+    except TelegramError: pass
+
+
+async def _join_timeout(ctx: ContextTypes.DEFAULT_TYPE):
+    d    = ctx.job.data
+    sto  = ctx.application.bot_data["store"]
+    game = sto.get_game(d["game_id"])
+    if not game or game.status != GameStatus.WAITING: return
+    creator = sto.get_user(d["creator_id"])
+    if creator: creator.credit_usd(Decimal(d["amount"]))
+    game.status = GameStatus.EXPIRED
+    sto.remove_game(d["game_id"])
+    try:
+        await ctx.bot.edit_message_text("⏰ Game expired — no one joined. Refunded.",
+            chat_id=d["chat_id"], message_id=d["message_id"])
+    except TelegramError: pass
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Dice emoji handler
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def dice_message_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg  = update.message
+    if not msg or not msg.dice: return
+    tg   = update.effective_user
+    sto  = _store(ctx)
+    game = sto.get_game_for_chat(update.effective_chat.id)
+    if not game or game.status != GameStatus.ACTIVE: return
+
+    emoji_to_type = {DiceEmoji.DICE:"dice", DiceEmoji.BOWLING:"bowling", DiceEmoji.DARTS:"darts"}
+    if emoji_to_type.get(msg.dice.emoji) != game.game_type.value: return
+    if tg.id not in (game.creator_id, game.joiner_id): return
+
+    game.add_roll(tg.id, msg.dice.value)
+
+    try:
+        await ctx.bot.edit_message_text(active_text(game),
+            chat_id=game.chat_id, message_id=game.message_id,
+            parse_mode=ParseMode.MARKDOWN)
+    except TelegramError: pass
+
+    if game.both_done():
+        game.resolve()
+        p1 = sto.get_user(game.creator_id)
+        p2 = sto.get_user(game.joiner_id)
+
+        if game.winner_id is None:
+            if p1: p1.credit_usd(game.winner_payout_usd)
+            if p2: p2.credit_usd(game.winner_payout_usd)
+        elif game.winner_id == game.creator_id:
+            if p1: p1.credit_usd(game.winner_payout_usd)
+        else:
+            if p2: p2.credit_usd(game.winner_payout_usd)
+
+        # Rake goes to house
+        sto.add_rake(game.house_fee_usd)
+        sto.total_volume_usd += game.wager_usd * 2
+
+        # Update stats
+        for pid, user in ((game.creator_id,p1),(game.joiner_id,p2)):
+            if user:
+                user.games_played += 1
+                user.total_wagered += game.wager_usd
+                user.favourite_game = game.game_type.value
+                if game.winner_id == pid:
+                    user.games_won += 1
+                    user.total_won += game.winner_payout_usd
+                    if game.winner_payout_usd > user.biggest_win:
+                        user.biggest_win = game.winner_payout_usd
+                elif game.winner_id is None:
+                    user.total_won += game.winner_payout_usd
+
+        sto.remove_game(game.game_id)
+        await ctx.bot.send_message(game.chat_id, result_text(game),
+                                   parse_mode=ParseMode.MARKDOWN)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Admin panel
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def admin_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not cfg.is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Admin only."); return
+    adm = _adm(ctx)
+    global _adm_state_global
+    _adm_state_global = adm
+    await update.message.reply_text("⚙️ *Admin Panel*",
+                                    reply_markup=admin_kb(adm),
+                                    parse_mode=ParseMode.MARKDOWN)
+
+
+async def admin_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await _answer(update)
+    if not cfg.is_admin(update.effective_user.id):
+        await _answer(update,"⛔ Admin only.",alert=True); return
+
+    data = update.callback_query.data
+    adm  = _adm(ctx)
+    sto  = _store(ctx)
+
+    if data == CB_ADMIN_BOT_TOGGLE:
+        adm["bot_betting_enabled"] = not adm.get("bot_betting_enabled",False)
+        s = "✅ Enabled" if adm["bot_betting_enabled"] else "❌ Disabled"
+        await _edit(update, f"⚙️ *Admin Panel*\nBot betting: {s}", admin_kb(adm))
+
+    elif data == CB_ADMIN_STATS:
+        # Get live prices for house coin values
+        pf     = swap_module.price_feed
+        lines  = []
+        total  = Decimal("0")
+        if pf:
+            try:
+                prices = await pf.get_usd_prices()
+                for coin, amt in sto.house_coin_holdings.items():
+                    if amt > 0:
+                        price = prices.get(coin, Decimal("0"))
+                        usd   = (amt * price).quantize(Decimal("0.01"))
+                        total += usd
+                        lines.append(f"  • {coin}: {amt:.6f} (≈${usd:.2f})")
+            except Exception: pass
+
+        holdings_text = "\n".join(lines) if lines else "  None"
+        await _edit(update,
+            f"📊 *Stats & House Balance*\n\n"
+            f"*House fund:* ${sto.house_balance_usd:.2f} USD\n\n"
+            f"*House coin holdings:*\n{holdings_text}\n"
+            f"*Coin holdings total:* ≈${total:.2f}\n\n"
+            f"*All time:*\n"
+            f"  Users: {len(sto.users)}\n"
+            f"  Volume: ${sto.total_volume_usd:.2f}\n"
+            f"  Rake collected: ${sto.total_rake_collected:.2f}\n"
+            f"  Active games: {len(sto.active_games)}",
+            InlineKeyboardMarkup([[_back(CB_ADMIN_PREFIX,"⬅️ Back")]]))
+
+    elif data == CB_ADMIN_HOUSE_ADDR:
+        addrs = adm.get("house_addresses",{})
+        lines = [f"  *{n}:*\n  `{a or 'not set'}`" for n,a in addrs.items()]
+        await _edit(update,
+            f"🏦 *House Addresses*\n\n" + "\n\n".join(lines) +
+            "\n\nReply: `network address`\nExample: `bsc 0xYourAddress`",
+            InlineKeyboardMarkup([[_back(CB_ADMIN_PREFIX,"⬅️ Back")]]))
+        ctx.user_data["admin_action"] = "set_house_addr"
+
+    elif data == "admin:house_withdraw":
+        await _edit(update,
+            f"💸 *Withdraw House Funds*\n\n"
+            f"House balance: *${sto.house_balance_usd:.2f}*\n\n"
+            f"Reply with:\n`amount coin your_address`\n\n"
+            f"Example:\n`500 USDT 0xYourAddress`",
+            InlineKeyboardMarkup([[_back(CB_ADMIN_PREFIX,"⬅️ Back")]]))
+        ctx.user_data["admin_action"] = "house_withdraw"
+
+    elif data == CB_ADMIN_REFERRAL_AMT:
+        await _edit(update,
+            f"👥 *Referral Bonus*\n\nCurrent: *${adm.get('referral_bonus',0):.2f}*\n\nReply with new USD amount:",
+            InlineKeyboardMarkup([[_back(CB_ADMIN_PREFIX,"⬅️ Back")]]))
+        ctx.user_data["admin_action"] = "set_referral"
+
+    elif data == CB_ADMIN_ADD_PROMO:
+        await _edit(update,
+            "🎟 *Add Promo*\n\nReply: `CODE usd_bonus uses`\nExample: `SUMMER10 10.00 50`",
+            InlineKeyboardMarkup([[_back(CB_ADMIN_PREFIX,"⬅️ Back")]]))
+        ctx.user_data["admin_action"] = "add_promo"
+
+    elif data == CB_ADMIN_LIST_PROMOS:
+        codes = adm.get("promo_codes",{})
+        text  = "🎟 *Promos*\n\n" + ("\n".join(
+            f"• `{c}` — ${v['bonus']:.2f} × {v['uses_left']} uses" for c,v in codes.items()
+        ) if codes else "_None_")
+        await _edit(update, text, InlineKeyboardMarkup([[_back(CB_ADMIN_PREFIX,"⬅️ Back")]]))
+
+    elif data == CB_ADMIN_TIP_LIMITS:
+        await _edit(update,
+            f"💝 *Tip Limits*\n\nMin: *${adm.get('tip_min',0):.2f}*  Max: *${adm.get('tip_max',0):.2f}*\n\nReply: `min max`",
+            InlineKeyboardMarkup([[_back(CB_ADMIN_PREFIX,"⬅️ Back")]]))
+        ctx.user_data["admin_action"] = "set_tip_limits"
+
+    elif data == CB_ADMIN_PREFIX:
+        await _edit(update,"⚙️ *Admin Panel*", admin_kb(adm))
+
+
+async def admin_text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not cfg.is_admin(update.effective_user.id): return
+    action = ctx.user_data.pop("admin_action",None)
+    if not action: return
+    adm  = _adm(ctx)
+    sto  = _store(ctx)
+    text = update.message.text.strip()
+
+    if action == "set_house_addr":
+        parts = text.split(maxsplit=1)
+        if len(parts)<2: await update.message.reply_text("❌ Format: network address"); return
+        adm.setdefault("house_addresses",{})[parts[0].lower()] = parts[1]
+        await update.message.reply_text(f"✅ *{parts[0]}* address set to `{parts[1]}`",
+                                        parse_mode=ParseMode.MARKDOWN)
+
+    elif action == "house_withdraw":
+        parts = text.split()
+        if len(parts)<3: await update.message.reply_text("❌ Format: amount coin address"); return
+        try:
+            amt  = Decimal(parts[0])
+            coin = parts[1].upper()
+            addr = parts[2]
+        except Exception:
+            await update.message.reply_text("❌ Invalid format."); return
+        if not sto.debit_house_usd(amt):
+            await update.message.reply_text(f"❌ House balance ${sto.house_balance_usd:.2f} insufficient."); return
+        await update.message.reply_text(
+            f"✅ House withdrawal initiated\n${amt:.2f} → {coin}\nTo: `{addr}`\n\n"
+            f"_Send manually from house wallet or via ChangeNow._",
+            parse_mode=ParseMode.MARKDOWN)
+
+    elif action == "set_referral":
+        try:
+            adm["referral_bonus"] = Decimal(text)
+            await update.message.reply_text(f"✅ Referral bonus: *${adm['referral_bonus']:.2f}*",
+                                            parse_mode=ParseMode.MARKDOWN)
+        except Exception: await update.message.reply_text("❌ Invalid amount.")
+
+    elif action == "add_promo":
+        parts = text.split()
+        if len(parts)<3: await update.message.reply_text("❌ Format: CODE amount uses"); return
+        try:
+            adm.setdefault("promo_codes",{})[parts[0].upper()] = {
+                "bonus": Decimal(parts[1]), "uses_left": int(parts[2])}
+            await update.message.reply_text(f"✅ Promo `{parts[0].upper()}` added",
+                                            parse_mode=ParseMode.MARKDOWN)
+        except Exception: await update.message.reply_text("❌ Invalid format.")
+
+    elif action == "set_tip_limits":
+        parts = text.split()
+        if len(parts)<2: await update.message.reply_text("❌ Format: min max"); return
+        try:
+            adm["tip_min"] = Decimal(parts[0]); adm["tip_max"] = Decimal(parts[1])
+            await update.message.reply_text(f"✅ Tips: ${adm['tip_min']} – ${adm['tip_max']}",
+                                            parse_mode=ParseMode.MARKDOWN)
+        except Exception: await update.message.reply_text("❌ Invalid.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Help / Back / Status / Cancel
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def help_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await _answer(update)
+    await _edit(update, (
+        "❓ *Help*\n\n"
+        "*Group commands:*\n"
+        "/dice — Dice game 🎲\n/bowl — Bowling 🎳\n/darts — Darts 🎯\n\n"
+        "*Modes:* Normal · Crazy (lowest wins) · Double (2 rolls) · Double Crazy\n\n"
+        "*Balance system:*\n"
+        "• Deposit any crypto → converted to USD\n"
+        "• Bet in USD ($1, $5, $10…)\n"
+        "• Withdraw in any coin via ChangeNow swap\n\n"
+        "*Darts scoring:* Bullseye=50 · Outer=25 · Triple=15 · Double=10 · Single=5 · Miss=0\n\n"
+        "*Fee:* 5% rake on games"
+    ), InlineKeyboardMarkup([[_back()]]))
+
+
+async def back_main_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await _answer(update)
+    u = _user(update, ctx)
+    await _edit(update, f"🏠 *Main Menu*\nBalance: *${u.usd_balance:.2f}*" if u else "🏠 *Main Menu*",
+                main_menu_kb())
+
+
+async def cancel_conv(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    await _answer(update)
+    await back_main_cb(update, ctx)
+    return ConversationHandler.END
+
+
+async def status_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not cfg.is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Admin only."); return
+    from .database import ping, pool_status
+    ok, msg = await ping(); pool = await pool_status()
+    sto = _store(ctx)
+    up  = int(time.time()-_START_TIME); h,r=divmod(up,3600); m,s=divmod(r,60)
+    try:
+        import psutil, os
+        mem = f"{psutil.Process(os.getpid()).memory_info().rss/1024/1024:.1f} MB"
+    except ImportError: mem = "N/A"
+    await update.message.reply_text(
+        f"📊 *Status*\n\nUptime: {h}h {m}m {s}s\n"
+        f"DB: {'✅' if ok else '❌'} {msg}\n"
+        f"Pool: {pool.get('checked_out',0)} active\n"
+        f"Users: {len(sto.users)}\nActive games: {len(sto.active_games)}\n"
+        f"House: ${sto.house_balance_usd:.2f}\nMemory: {mem}",
+        parse_mode=ParseMode.MARKDOWN)
+
+
+async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
+    logger.error("Exception:", exc_info=ctx.error)
+    if isinstance(ctx.error, Forbidden): return
     if isinstance(update, Update) and update.effective_message:
         try:
-            await update.effective_message.reply_text(
-                "⚠️ *Something went wrong.*\nPlease try again or use /menu.",
-                parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu_kb(),
-            )
-        except TelegramError:
-            pass
+            await update.effective_message.reply_text("⚠️ Something went wrong. Try again.",
+                                                       reply_markup=main_menu_kb())
+        except TelegramError: pass
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -790,31 +1277,31 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 def register_all_handlers(app: Application) -> None:
     # Commands
     app.add_handler(CommandHandler("start",  start))
-    app.add_handler(CommandHandler("menu",   menu_cmd))
-    app.add_handler(CommandHandler("wallet", wallet_cmd))
-    app.add_handler(CommandHandler("help",   help_cmd))
+    app.add_handler(CommandHandler("admin",  admin_command))
     app.add_handler(CommandHandler("status", status_command))
+    app.add_handler(CommandHandler("tip",    tip_command))
+    app.add_handler(CommandHandler("promo",  promo_command))
+    app.add_handler(CommandHandler("dice",   dice_command))
+    app.add_handler(CommandHandler("bowl",   bowl_command))
+    app.add_handler(CommandHandler("darts",  darts_command))
 
-    # Wallet conversation
+    # Dice emoji in groups
+    app.add_handler(MessageHandler(
+        filters.Dice(emoji=[DiceEmoji.DICE, DiceEmoji.BOWLING, DiceEmoji.DARTS]) & ~filters.PRIVATE,
+        dice_message_handler))
+
+    # Withdrawal conversation
     app.add_handler(ConversationHandler(
-        entry_points=[
-            CallbackQueryHandler(wallet_cb, pattern=f"^{CB_WALLET_DEPOSIT}$"),
-            CallbackQueryHandler(wallet_cb, pattern=f"^{CB_WALLET_WITHDRAW}$"),
-            CallbackQueryHandler(wallet_cb, pattern=f"^{CB_WALLET_REFRESH}$"),
-        ],
+        entry_points=[CallbackQueryHandler(wallet_cb, pattern=f"^{CB_WALLET_WITHDRAW}$")],
         states={
-            State.DEPOSIT_SELECT_NET: [
-                CallbackQueryHandler(deposit_net_selected, pattern=r"^lobby:net:"),
+            State.WITHDRAW_AMOUNT:  [
+                MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, withdraw_amount_text),
+                CallbackQueryHandler(withdraw_amount_cb, pattern=r"^withdraw:"),
                 CallbackQueryHandler(cancel_conv, pattern=f"^{CB_CANCEL}$"),
             ],
             State.WITHDRAW_ADDRESS: [
-                CallbackQueryHandler(withdraw_tok_selected, pattern=r"^withdraw:select:"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, withdraw_address_received),
                 CallbackQueryHandler(cancel_conv, pattern=f"^{CB_CANCEL}$"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, withdraw_addr_received),
-            ],
-            State.WITHDRAW_AMOUNT: [
-                CallbackQueryHandler(cancel_conv, pattern=f"^{CB_CANCEL}$"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, withdraw_amt_received),
             ],
             State.WITHDRAW_CONFIRM: [
                 CallbackQueryHandler(withdraw_confirmed, pattern=r"^withdraw:confirm$"),
@@ -828,42 +1315,30 @@ def register_all_handlers(app: Application) -> None:
         per_message=False, allow_reentry=True,
     ))
 
-    # Game lobby conversation
-    app.add_handler(ConversationHandler(
-        entry_points=[CallbackQueryHandler(play_cb, pattern=f"^{CB_MENU_PLAY}$")],
-        states={
-            State.LOBBY_GAME_TYPE: [
-                CallbackQueryHandler(lobby_game_type, pattern=r"^lobby:game:"),
-                CallbackQueryHandler(cancel_conv, pattern=f"^{CB_LOBBY_CANCEL}$"),
-                CallbackQueryHandler(menu_cb, pattern=f"^{CB_BACK_MAIN}$"),
-            ],
-            State.LOBBY_NETWORK: [
-                CallbackQueryHandler(lobby_network, pattern=r"^lobby:net:"),
-                CallbackQueryHandler(cancel_conv, pattern=f"^{CB_LOBBY_CANCEL}$"),
-            ],
-            State.LOBBY_TOKEN: [
-                CallbackQueryHandler(lobby_token, pattern=r"^lobby:token:"),
-                CallbackQueryHandler(cancel_conv, pattern=f"^{CB_LOBBY_CANCEL}$"),
-            ],
-            State.LOBBY_WAGER: [
-                CallbackQueryHandler(lobby_wager, pattern=r"^lobby:wager:"),
-                CallbackQueryHandler(cancel_conv, pattern=f"^{CB_LOBBY_CANCEL}$"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, lobby_wager_text),
-            ],
-            State.LOBBY_CONFIRM: [
-                CallbackQueryHandler(lobby_confirm, pattern=f"^{CB_LOBBY_CONFIRM}$"),
-                CallbackQueryHandler(cancel_conv, pattern=f"^{CB_LOBBY_CANCEL}$"),
-            ],
-        },
-        fallbacks=[
-            CallbackQueryHandler(cancel_conv, pattern=f"^{CB_LOBBY_CANCEL}$"),
-            CommandHandler("cancel", cancel_conv),
-        ],
-        per_message=False, allow_reentry=True,
-    ))
+    # Admin text replies
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
+        admin_text_handler), group=1)
 
-    # Main menu and matchmaking callbacks
-    app.add_handler(CallbackQueryHandler(menu_cb,      pattern=r"^menu:|^back:main$"))
-    app.add_handler(CallbackQueryHandler(match_cancel, pattern=f"^{CB_MATCH_CANCEL}$"))
+    # Game wager text
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS,
+        game_wager_text), group=2)
+
+    # Callbacks
+    app.add_handler(CallbackQueryHandler(join_game_cb,    pattern=f"^{CB_GAME_JOIN}"))
+    app.add_handler(CallbackQueryHandler(cancel_game_cb,  pattern=f"^{CB_GAME_CANCEL}"))
+    app.add_handler(CallbackQueryHandler(game_mode_cb,    pattern=f"^{CB_MODE_PREFIX}"))
+    app.add_handler(CallbackQueryHandler(game_wager_cb,   pattern=f"^{CB_WAGER_PREFIX}|^{CB_WAGER_CUSTOM}$"))
+    app.add_handler(CallbackQueryHandler(coin_selected,   pattern=f"^{CB_COIN_PREFIX}"))
+    app.add_handler(CallbackQueryHandler(pref_coin_cb,    pattern=r"^pref_coin:"))
+    app.add_handler(CallbackQueryHandler(withdraw_amount_cb, pattern=r"^withdraw:"))
+    app.add_handler(CallbackQueryHandler(profile_cb,      pattern=r"^menu:profile$|^profile:|^settings:"))
+    app.add_handler(CallbackQueryHandler(wallet_cb,       pattern=r"^menu:wallet$|^wallet:"))
+    app.add_handler(CallbackQueryHandler(referral_cb,     pattern=r"^menu:referral$"))
+    app.add_handler(CallbackQueryHandler(help_cb,         pattern=r"^menu:help$"))
+    app.add_handler(CallbackQueryHandler(admin_cb,        pattern=r"^admin:"))
+    app.add_handler(CallbackQueryHandler(back_main_cb,    pattern=f"^{CB_BACK_MAIN}$"))
+    app.add_handler(CallbackQueryHandler(cancel_conv,     pattern=f"^{CB_CANCEL}$"))
 
     app.add_error_handler(error_handler)
