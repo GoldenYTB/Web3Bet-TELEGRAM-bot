@@ -269,14 +269,23 @@ def _on_deposit(app: Application):
 async def _register_commands(app: Application) -> None:
     commands = [
         BotCommand("start",   "Register / open main menu"),
-        BotCommand("menu",    "Open main menu"),
-        BotCommand("wallet",  "View wallet balances"),
+        BotCommand("wallet",  "Wallet — deposit, withdraw, tip"),
         BotCommand("help",    "How to play & FAQs"),
-        BotCommand("status",  "System health (admins only)"),
+        BotCommand("tip",     "Tip another user"),
+        BotCommand("promo",   "Redeem a promo code"),
         BotCommand("cancel",  "Cancel current operation"),
     ]
+    group_commands = [
+        BotCommand("dice",    "🎲 Start a dice game"),
+        BotCommand("bowl",    "🎳 Start a bowling game"),
+        BotCommand("darts",   "🎯 Start a darts game"),
+    ]
     try:
-        await app.bot.set_my_commands(commands)
+        from telegram import BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats
+        await app.bot.set_my_commands(commands, scope=BotCommandScopeAllPrivateChats())
+        await app.bot.set_my_commands(group_commands, scope=BotCommandScopeAllGroupChats())
+        logging.getLogger("startup").info("Bot commands set — private: %d, groups: %d",
+                                          len(commands), len(group_commands))
     except TelegramError as exc:
         logging.getLogger("startup").warning("Could not set bot commands: %s", exc)
 

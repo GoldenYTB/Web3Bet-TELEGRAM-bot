@@ -248,6 +248,32 @@ COINS: dict[str, dict] = {
     "TON":   {"emoji": "💎", "name": "Toncoin",       "network": "ton",       "token": "TON",  "address": None},
 }
 
+# ── Multi-network coins — show network picker on deposit ─────────────────────
+# coin_symbol → list of {network, label, token_address}
+MULTI_NETWORK_COINS: dict[str, list[dict]] = {
+    "USDT": [
+        {"network": "ethereum",   "label": "USDT Ethereum (ERC-20)", "address": "0xdAC17F958D2ee523a2206206994597C13D831ec7"},
+        {"network": "bsc",        "label": "USDT BSC (BEP-20)",      "address": "0x55d398326f99059fF775485246999027B3197955"},
+        {"network": "tron",       "label": "USDT Tron (TRC-20)",     "address": "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"},
+        {"network": "solana",     "label": "USDT Solana (SPL)",      "address": "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"},
+        {"network": "polygon",    "label": "USDT Polygon",           "address": "0xc2132D05D31c914a87C6611C10748AEb04B58e8F"},
+    ],
+    "USDC": [
+        {"network": "ethereum",   "label": "USDC Ethereum (ERC-20)", "address": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"},
+        {"network": "bsc",        "label": "USDC BSC (BEP-20)",      "address": "0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d"},
+        {"network": "solana",     "label": "USDC Solana (SPL)",      "address": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"},
+        {"network": "polygon",    "label": "USDC Polygon",           "address": "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"},
+    ],
+    "DAI": [
+        {"network": "ethereum",   "label": "DAI Ethereum (ERC-20)",  "address": "0x6B175474E89094C44Da98b954EedeAC495271d0F"},
+        {"network": "polygon",    "label": "DAI Polygon",            "address": "0x8f3Cf7ad23Cd3CaDbD9735AFf958023239c6A063"},
+    ],
+    "BNB": [
+        {"network": "bsc",        "label": "BNB Chain (native)",     "address": None},
+        {"network": "ethereum",   "label": "BNB Ethereum (ERC-20)",  "address": "0xB8c77482e45F1F44dE1745F52C74426C631bDD52"},
+    ],
+}
+
 # ── Networks (for wallet generation) ─────────────────────────────────────────
 NETWORKS: dict[str, dict] = {
     # EVM

@@ -36,7 +36,7 @@ from telegram.ext import (
 )
 
 from .config import (
-    cfg, COINS, NETWORKS, GAME_TYPES, GAME_MODES, PRESET_WAGERS,
+    cfg, COINS, NETWORKS, MULTI_NETWORK_COINS, GAME_TYPES, GAME_MODES, PRESET_WAGERS,
     DEFAULT_ADMIN_STATE, MIN_WAGER, MAX_WAGER, HOUSE_FEE_PCT, State,
     CB_BACK_MAIN, CB_CANCEL,
     CB_MENU_PROFILE, CB_MENU_WALLET, CB_MENU_HELP, CB_MENU_REFERRAL,
@@ -155,6 +155,7 @@ def _back(data=CB_BACK_MAIN, label="⬅️ Back"):
 
 def main_menu_kb():
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎮 PLAY GAMES", callback_data="menu:games")],
         [InlineKeyboardButton("👤 Profile",  callback_data=CB_MENU_PROFILE),
          InlineKeyboardButton("💰 Wallet",   callback_data=CB_MENU_WALLET)],
         [InlineKeyboardButton("👥 Referral", callback_data=CB_MENU_REFERRAL),
@@ -305,6 +306,33 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 #  Profile
 # ══════════════════════════════════════════════════════════════════════════════
 
+async def games_menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show all available games with descriptions."""
+    await _answer(update)
+    msg = (
+        "\U0001f3ae *Games*\n\n"
+        "All games are played in group chats.\n"
+        "Add the bot to a group first!\n\n"
+        "\U0001f3b2 *Dice* \u2014 Roll 1\u20136, highest wins\n"
+        "\U0001f3b3 *Bowling* \u2014 Bowl the pins, highest wins\n"
+        "\U0001f3af *Darts* \u2014 3 throws each, highest total wins\n\n"
+        "*Game modes:*\n"
+        "\u2022 Normal \u2014 highest score wins\n"
+        "\u2022 Crazy \U0001f92a \u2014 lowest score wins\n"
+        "\u2022 Double \xd72 \u2014 2 rolls, scores added\n"
+        "\u2022 Double Crazy \u2014 2 rolls, lowest total wins\n\n"
+        "*How to start:*\n"
+        "Go to your group and type /dice, /bowl or /darts"
+    )
+    await _edit(update, msg,
+        InlineKeyboardMarkup([
+            [InlineKeyboardButton("\U0001f3b2 Dice",    callback_data="game_info:dice"),
+             InlineKeyboardButton("\U0001f3b3 Bowling", callback_data="game_info:bowling")],
+            [InlineKeyboardButton("\U0001f3af Darts",   callback_data="game_info:darts")],
+            [_back()],
+        ]))
+
+
 async def _show_profile(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u   = _user(update, ctx)
     tg  = update.effective_user
@@ -453,52 +481,116 @@ async def wallet_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def coin_selected(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """User picked a coin from the deposit grid."""
     await _answer(update)
-    data  = update.callback_query.data  # coin:deposit:ETH or coin:withdraw:ETH
+    data  = update.callback_query.data  # coin:deposit:ETH  or  coin:withdraw:ETH
     parts = data.split(":")
     if len(parts) < 3: return
     action, sym = parts[1], parts[2]
     if sym not in COINS:
-        await _answer(update,"Unknown coin.",alert=True); return
-
-    u    = _user(update, ctx)
-    coin = COINS[sym]
-    net  = coin["network"]
+        await _answer(update, "Unknown coin.", alert=True); return
 
     if action == "deposit":
-        # Generate real wallet if not already done for this coin
-        if sym not in u.deposit_addresses:
-            wm = ctx.application.bot_data.get("wallet_manager")
-            if wm:
-                try:
-                    info = await wm.generate_wallet(net)
-                    u.deposit_addresses[sym] = info.address
-                    u.deposit_keys[sym]      = info.encrypted_private_key
-                except Exception as exc:
-                    logger.error("Wallet gen %s failed: %s", sym, exc)
-                    await _edit(update,
-                        f"❌ Could not generate {sym} address.\nTry again later.",
-                        InlineKeyboardMarkup([[_back(CB_WALLET_DEPOSIT,"⬅️ Back")]]))
-                    return
+        # Multi-network coins → show network picker first
+        if sym in MULTI_NETWORK_COINS:
+            nets = MULTI_NETWORK_COINS[sym]
+            coin = COINS[sym]
+            rows = []
+            for n in nets:
+                rows.append([InlineKeyboardButton(
+                    n["label"],
+                    callback_data=f"deposit_net:{sym}:{n['network']}"
+                )])
+            rows.append([_back(CB_WALLET_DEPOSIT, "⬅️ Back")])
+            await _edit(update,
+                f"\U0001f4e5 *Deposit {coin['emoji']} {sym}*\n\nSelect network:",
+                InlineKeyboardMarkup(rows))
+        else:
+            # Single-network coin → generate address directly
+            await _do_deposit(update, ctx, sym, COINS[sym]["network"])
+
+    elif action == "withdraw":
+        u   = _user(update, ctx)
+        coin = COINS[sym]
+        net  = coin["network"]
+        await _handle_withdraw_start(update, ctx)
+
+
+async def deposit_network_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """User picked a network from the USDT/USDC/DAI network picker."""
+    await _answer(update)
+    # data = deposit_net:USDT:bsc
+    parts = update.callback_query.data.split(":")
+    if len(parts) < 3: return
+    sym, net = parts[1], parts[2]
+    await _do_deposit(update, ctx, sym, net)
+
+
+async def _do_deposit(
+    update: Update, ctx: ContextTypes.DEFAULT_TYPE,
+    sym: str, network: str
+) -> None:
+    """Generate (or retrieve) a deposit address and show it."""
+    u    = _user(update, ctx)
+    coin = COINS.get(sym, {})
+    wm   = ctx.application.bot_data.get("wallet_manager")
+
+    # Address key includes network so USDT-ETH and USDT-BSC are separate
+    addr_key = f"{sym}:{network}"
+
+    if addr_key not in u.deposit_addresses:
+        if not wm:
+            await _edit(update,
+                "⚠️ *Wallet manager not connected.*\nTry again in a moment.",
+                InlineKeyboardMarkup([[_back(CB_WALLET_DEPOSIT, "⬅️ Back")]]))
+            return
+        try:
+            # ERC-20 tokens on EVM chains share the same 0x address as the
+            # native coin of that network — so reuse if already generated
+            evm_nets = {"ethereum", "bsc", "polygon"}
+            if network in evm_nets:
+                # Check if we already have an EVM wallet for this network
+                native_key = f"NATIVE:{network}"
+                if native_key in u.deposit_addresses:
+                    address     = u.deposit_addresses[native_key]
+                    enc_key     = u.deposit_keys[native_key]
+                else:
+                    info        = await wm.generate_wallet(network)
+                    address     = info.address
+                    enc_key     = info.encrypted_private_key
+                    u.deposit_addresses[native_key] = address
+                    u.deposit_keys[native_key]      = enc_key
             else:
-                await _edit(update,
-                    "⚠️ *Wallet manager not connected.*",
-                    InlineKeyboardMarkup([[_back(CB_WALLET_DEPOSIT,"⬅️ Back")]]))
-                return
+                info    = await wm.generate_wallet(network)
+                address = info.address
+                enc_key = info.encrypted_private_key
 
-        address   = u.deposit_addresses[sym]
-        net_label = NETWORKS[net]["label"]
+            u.deposit_addresses[addr_key] = address
+            u.deposit_keys[addr_key]      = enc_key
 
-        await _edit(update,
-            f"📥 *Deposit {coin['emoji']} {sym}*\n\n"
-            f"Network: *{net_label}*\n\n"
-            f"↔️ *Send to:*\n`{address}`\n\n"
-            f"💵 Your balance updates in USD after confirmation.\n"
-            f"_Min deposit: any amount_",
-            InlineKeyboardMarkup([
-                [InlineKeyboardButton("📋 Copy address", switch_inline_query=address)],
-                [_back(CB_WALLET_DEPOSIT,"⬅️ Back")],
-            ]))
+        except Exception as exc:
+            logger.error("Wallet gen %s/%s failed: %s", sym, network, exc)
+            await _edit(update,
+                f"❌ Could not generate {sym} address. Try again later.",
+                InlineKeyboardMarkup([[_back(CB_WALLET_DEPOSIT, "⬅️ Back")]]))
+            return
+
+    address   = u.deposit_addresses[addr_key]
+    net_label = NETWORKS.get(network, {}).get("label", network)
+    emoji     = coin.get("emoji", "")
+
+    deposit_text = (
+        f"\U0001f4e5 *Deposit {emoji} {sym}*\n\n"
+        f"Network: *{net_label}*\n\n"
+        f"\u21d4 *Send to:*\n`{address}`\n\n"
+        f"Balance updates in USD after confirmation.\n"
+        f"Only send {sym} on {net_label.split()[0]} network."
+    )
+    await _edit(update, deposit_text,
+        InlineKeyboardMarkup([
+            [InlineKeyboardButton("📋 Copy address", switch_inline_query=address)],
+            [_back(CB_WALLET_DEPOSIT, "⬅️ Back")],
+        ]))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1330,6 +1422,7 @@ def register_all_handlers(app: Application) -> None:
     app.add_handler(CallbackQueryHandler(cancel_game_cb,  pattern=f"^{CB_GAME_CANCEL}"))
     app.add_handler(CallbackQueryHandler(game_mode_cb,    pattern=f"^{CB_MODE_PREFIX}"))
     app.add_handler(CallbackQueryHandler(game_wager_cb,   pattern=f"^{CB_WAGER_PREFIX}|^{CB_WAGER_CUSTOM}$"))
+    app.add_handler(CallbackQueryHandler(deposit_network_cb, pattern=r"^deposit_net:"))
     app.add_handler(CallbackQueryHandler(coin_selected,   pattern=f"^{CB_COIN_PREFIX}"))
     app.add_handler(CallbackQueryHandler(pref_coin_cb,    pattern=r"^pref_coin:"))
     app.add_handler(CallbackQueryHandler(withdraw_amount_cb, pattern=r"^withdraw:"))
@@ -1338,6 +1431,7 @@ def register_all_handlers(app: Application) -> None:
     app.add_handler(CallbackQueryHandler(referral_cb,     pattern=r"^menu:referral$"))
     app.add_handler(CallbackQueryHandler(help_cb,         pattern=r"^menu:help$"))
     app.add_handler(CallbackQueryHandler(admin_cb,        pattern=r"^admin:"))
+    app.add_handler(CallbackQueryHandler(games_menu_cb,   pattern=r"^menu:games$"))
     app.add_handler(CallbackQueryHandler(back_main_cb,    pattern=f"^{CB_BACK_MAIN}$"))
     app.add_handler(CallbackQueryHandler(cancel_conv,     pattern=f"^{CB_CANCEL}$"))
 
