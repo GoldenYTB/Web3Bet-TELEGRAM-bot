@@ -1287,7 +1287,7 @@ def register_all_handlers(app: Application) -> None:
 
     # Dice emoji in groups
     app.add_handler(MessageHandler(
-        filters.Dice(emoji=[DiceEmoji.DICE, DiceEmoji.BOWLING, DiceEmoji.DARTS]) & ~filters.PRIVATE,
+        (filters.Dice(emoji=DiceEmoji.DICE) | filters.Dice(emoji=DiceEmoji.BOWLING) | filters.Dice(emoji=DiceEmoji.DARTS)) & ~filters.PRIVATE,
         dice_message_handler))
 
     # Withdrawal conversation
