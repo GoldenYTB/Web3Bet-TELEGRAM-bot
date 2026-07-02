@@ -153,14 +153,31 @@ def _back(data=CB_BACK_MAIN, label="⬅️ Back"):
 #  Keyboards
 # ══════════════════════════════════════════════════════════════════════════════
 
-def main_menu_kb():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎮 PLAY GAMES", callback_data="menu:games")],
+def main_menu_kb(socials: dict = None) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("🎮 PvP Games",   callback_data="menu:games"),
+         InlineKeyboardButton("🏠 House Games", callback_data="house:menu")],
         [InlineKeyboardButton("👤 Profile",  callback_data=CB_MENU_PROFILE),
          InlineKeyboardButton("💰 Wallet",   callback_data=CB_MENU_WALLET)],
         [InlineKeyboardButton("👥 Referral", callback_data=CB_MENU_REFERRAL),
          InlineKeyboardButton("❓ Help",      callback_data=CB_MENU_HELP)],
-    ])
+    ]
+    if socials:
+        social_defs = [
+            ("channel", "📢 Channel"),
+            ("chat",    "💬 Chat"),
+            ("twitter", "🐦 Twitter"),
+            ("tiktok",  "🎵 TikTok"),
+            ("youtube", "📺 YouTube"),
+            ("discord", "🎮 Discord"),
+        ]
+        active = [(label, socials[key]) for key, label in social_defs if socials.get(key)]
+        for i in range(0, len(active), 2):
+            row = []
+            for label, url in active[i:i+2]:
+                row.append(InlineKeyboardButton(label, url=url))
+            rows.append(row)
+    return InlineKeyboardMarkup(rows)
 
 def profile_kb():
     return InlineKeyboardMarkup([
@@ -237,6 +254,7 @@ def admin_kb(adm: dict):
         [InlineKeyboardButton("🎟 Add promo code",         callback_data=CB_ADMIN_ADD_PROMO)],
         [InlineKeyboardButton("📋 List promos",            callback_data=CB_ADMIN_LIST_PROMOS)],
         [InlineKeyboardButton("💝 Tip limits",             callback_data=CB_ADMIN_TIP_LIMITS)],
+        [InlineKeyboardButton("🔗 Social links",           callback_data="admin:socials")],
     ])
 
 def preferred_coin_kb():
@@ -257,6 +275,12 @@ def preferred_coin_kb():
 # ══════════════════════════════════════════════════════════════════════════════
 #  /start
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _main_menu_with_socials(ctx) -> InlineKeyboardMarkup:
+    """Build main menu keyboard with current social links."""
+    socials = _adm(ctx).get("socials", {})
+    return main_menu_kb(socials)
+
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     tg  = update.effective_user
@@ -299,7 +323,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         text = f"👋 Welcome back, *{tg.first_name}*!\n\nBalance: *${u.usd_balance:.2f}*"
 
-    await update.message.reply_text(text, reply_markup=main_menu_kb(), parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(text, reply_markup=_main_menu_with_socials(ctx), parse_mode=ParseMode.MARKDOWN)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1248,6 +1272,25 @@ async def admin_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardMarkup([[_back(CB_ADMIN_PREFIX,"⬅️ Back")]]))
         ctx.user_data["admin_action"] = "set_tip_limits"
 
+    elif data == "admin:socials":
+        socials = adm.get("socials", {})
+        lines   = []
+        defs = [("channel","📢 Channel"),("chat","💬 Chat"),("twitter","🐦 Twitter"),
+                ("tiktok","🎵 TikTok"),("youtube","📺 YouTube"),("discord","🎮 Discord")]
+        for key, label in defs:
+            val = socials.get(key, "")
+            lines.append(f"{label}: {('`' + val + '`') if val else '_not set_'}")
+        social_text = (
+            "\U0001f517 *Social Links*\n\n"
+            + "\n".join(lines)
+            + "\n\nReply: `platform url`"
+            + "\nExample: `twitter https://twitter.com/web3bet`"
+            + "\nPlatforms: channel, chat, twitter, tiktok, youtube, discord"
+        )
+        await _edit(update, social_text,
+            InlineKeyboardMarkup([[_back(CB_ADMIN_PREFIX,"\u2b05\ufe0f Back")]]))
+        ctx.user_data["admin_action"] = "set_social"
+
     elif data == CB_ADMIN_PREFIX:
         await _edit(update,"⚙️ *Admin Panel*", admin_kb(adm))
 
@@ -1266,6 +1309,22 @@ async def admin_text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         adm.setdefault("house_addresses",{})[parts[0].lower()] = parts[1]
         await update.message.reply_text(f"✅ *{parts[0]}* address set to `{parts[1]}`",
                                         parse_mode=ParseMode.MARKDOWN)
+
+    elif action == "set_social":
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2:
+            await update.message.reply_text("❌ Format: platform url\nExample: twitter https://twitter.com/web3bet"); return
+        platform = parts[0].lower()
+        url      = parts[1].strip()
+        valid    = {"channel","chat","twitter","tiktok","youtube","discord"}
+        if platform not in valid:
+            await update.message.reply_text(f"❌ Platform must be one of:\n{', '.join(sorted(valid))}"); return
+        adm.setdefault("socials",{})[platform] = url
+        await update.message.reply_text(
+            f"✅ *{platform.title()}* link saved!\n\n"
+            f"URL: {url}\n\n"
+            f"Users will now see a *{platform.title()}* button in the main menu.",
+            parse_mode=ParseMode.MARKDOWN)
 
     elif action == "house_withdraw":
         parts = text.split()

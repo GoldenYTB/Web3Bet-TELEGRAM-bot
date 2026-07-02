@@ -383,9 +383,9 @@ CB_ADMIN_STATS        = "admin:stats"
 # ── Runtime admin state (mutable, lives in bot_data) ─────────────────────────
 # Default values — admin can change all of these live via /admin panel
 DEFAULT_ADMIN_STATE: dict = {
-    "bot_betting_enabled": False,    # admin toggles this
-    "referral_bonus":      Decimal("0.50"),   # paid to referrer per new user
-    "promo_codes":         {},        # code → {"bonus": Decimal, "uses_left": int}
+    "bot_betting_enabled": False,
+    "referral_bonus":      Decimal("0.50"),
+    "promo_codes":         {},
     "tip_min":             Decimal("0.01"),
     "tip_max":             Decimal("100"),
     "house_addresses": {
@@ -393,6 +393,15 @@ DEFAULT_ADMIN_STATE: dict = {
         "bsc":      cfg.house_address_bsc,
         "polygon":  cfg.house_address_polygon,
         "solana":   cfg.house_address_solana,
+    },
+    # Social links — set via /admin → Socials
+    "socials": {
+        "channel":  "",   # Telegram channel e.g. https://t.me/Web3BetChannel
+        "chat":     "",   # Telegram group
+        "twitter":  "",
+        "tiktok":   "",
+        "youtube":  "",
+        "discord":  "",
     },
 }
 

@@ -125,6 +125,11 @@ async def _post_init(app: Application) -> None:
     else:
         log.warning("Database unreachable: %s — in-memory store only", db_msg)
 
+    # ── Game registry (game toggle system) ───────────────────────────────────────
+    from gaming_bot.game_registry import GameRegistry
+    app.bot_data["game_registry"] = GameRegistry()
+    log.info("Game registry: %d games loaded", len(app.bot_data["game_registry"].all()))
+
     # ── In-memory game store ──────────────────────────────────────────────────
     app.bot_data["store"]    = Store()
     app.bot_data["settings"] = cfg
