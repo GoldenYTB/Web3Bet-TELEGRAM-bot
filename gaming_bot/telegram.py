@@ -155,8 +155,7 @@ def _back(data=CB_BACK_MAIN, label="⬅️ Back"):
 
 def main_menu_kb(socials: dict = None) -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton("🎮 PvP Games",   callback_data="menu:games"),
-         InlineKeyboardButton("🏠 House Games", callback_data="house:menu")],
+        [InlineKeyboardButton("🎮 Games", callback_data="menu:games")],
         [InlineKeyboardButton("👤 Profile",  callback_data=CB_MENU_PROFILE),
          InlineKeyboardButton("💰 Wallet",   callback_data=CB_MENU_WALLET)],
         [InlineKeyboardButton("👥 Referral", callback_data=CB_MENU_REFERRAL),
@@ -331,30 +330,77 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def games_menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Show all available games with descriptions."""
+    """Show all enabled games — players only see games that are ON."""
     await _answer(update)
-    msg = (
-        "\U0001f3ae *Games*\n\n"
-        "All games are played in group chats.\n"
-        "Add the bot to a group first!\n\n"
-        "\U0001f3b2 *Dice* \u2014 Roll 1\u20136, highest wins\n"
-        "\U0001f3b3 *Bowling* \u2014 Bowl the pins, highest wins\n"
-        "\U0001f3af *Darts* \u2014 3 throws each, highest total wins\n\n"
-        "*Game modes:*\n"
-        "\u2022 Normal \u2014 highest score wins\n"
-        "\u2022 Crazy \U0001f92a \u2014 lowest score wins\n"
-        "\u2022 Double \xd72 \u2014 2 rolls, scores added\n"
-        "\u2022 Double Crazy \u2014 2 rolls, lowest total wins\n\n"
-        "*How to start:*\n"
-        "Go to your group and type /dice, /bowl or /darts"
-    )
-    await _edit(update, msg,
-        InlineKeyboardMarkup([
-            [InlineKeyboardButton("\U0001f3b2 Dice",    callback_data="game_info:dice"),
-             InlineKeyboardButton("\U0001f3b3 Bowling", callback_data="game_info:bowling")],
-            [InlineKeyboardButton("\U0001f3af Darts",   callback_data="game_info:darts")],
-            [_back()],
-        ]))
+    reg   = ctx.application.bot_data.get("game_registry")
+    u     = _user(update, ctx)
+    bal   = f"${u.usd_balance:.2f}" if u else "$0.00"
+
+    if not reg:
+        await _edit(update, "🎮 *Games*\n\n_Loading..._", InlineKeyboardMarkup([[_back()]]))
+        return
+
+    all_enabled = reg.enabled()  # only ON games
+    if not all_enabled:
+        await _edit(update,
+            "🎮 *Games*\n\n_No games are currently available. Check back soon!_",
+            InlineKeyboardMarkup([[_back()]]))
+        return
+
+    rows = []
+    # Group games by 2 per row
+    for i in range(0, len(all_enabled), 2):
+        row = []
+        for g in all_enabled[i:i+2]:
+            row.append(InlineKeyboardButton(
+                f"{g.emoji} {g.name}",
+                callback_data=f"game_start:{g.key}"
+            ))
+        rows.append(row)
+    rows.append([_back()])
+
+    await _edit(update,
+        f"🎮 *Games*\n\nBalance: *{bal}*\n\nChoose a game:",
+        InlineKeyboardMarkup(rows))
+
+
+async def game_start_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Route to the correct game when player selects it."""
+    await _answer(update)
+    game_key = update.callback_query.data.split(":")[1]
+    reg      = ctx.application.bot_data.get("game_registry")
+    if not reg:
+        return
+    game = reg.get(game_key)
+    if not game or not game.enabled:
+        await _answer(update, "This game is not available right now.", alert=True)
+        return
+
+    if game.category == "pvp":
+        # PvP games — tell them to go to group chat
+        pvp_info = {
+            "dice":    ("🎲", "/dice"),
+            "bowling": ("🎳", "/bowl"),
+            "darts":   ("🎯", "/darts"),
+        }
+        emoji, cmd = pvp_info.get(game_key, ("🎮", f"/{game_key}"))
+        await _edit(update,
+            f"{emoji} *{game.name}*\n\n"
+            f"_{game.description}_\n\n"
+            f"This is a PvP game — played in group chats.\n\n"
+            f"Go to a group where this bot is added and type `{cmd}`",
+            InlineKeyboardMarkup([[_back("menu:games", "⬅️ Games")]]))
+    else:
+        # House game — start directly here in private chat
+        from .house_handlers import _start_house_game
+        u = _user(update, ctx)
+
+        # Show wager selection
+        from .house_handlers import wager_kb
+        ctx.user_data["house_game"] = game_key
+        await _edit(update,
+            f"{game.emoji} *{game.name}*\n\n_{game.description}_\n\nChoose your wager:",
+            wager_kb(game_key))
 
 
 async def _show_profile(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1674,6 +1720,7 @@ def register_all_handlers(app: Application) -> None:
     app.add_handler(CallbackQueryHandler(help_cb,         pattern=r"^menu:help$"))
     app.add_handler(CallbackQueryHandler(admin_cb,        pattern=r"^admin:"))
     app.add_handler(CallbackQueryHandler(games_menu_cb,   pattern=r"^menu:games$"))
+    app.add_handler(CallbackQueryHandler(game_start_cb,   pattern=r"^game_start:"))
     app.add_handler(CallbackQueryHandler(back_main_cb,    pattern=f"^{CB_BACK_MAIN}$"))
     app.add_handler(CallbackQueryHandler(cancel_conv,     pattern=f"^{CB_CANCEL}$"))
 

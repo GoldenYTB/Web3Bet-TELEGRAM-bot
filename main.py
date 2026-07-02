@@ -347,12 +347,35 @@ async def _register_commands(app: Application) -> None:
         BotCommand("bowl",    "🎳 Start a bowling game"),
         BotCommand("darts",   "🎯 Start a darts game"),
     ]
+    admin_commands = [
+        BotCommand("admin",         "⚙️ Admin panel"),
+        BotCommand("adminhelp",     "📋 Full admin command list"),
+        BotCommand("toggle_game",   "🎮 Toggle a game on/off"),
+        BotCommand("list_games",    "📋 List all games + status"),
+        BotCommand("resetbalance",  "💰 Reset user balance"),
+        BotCommand("givebalance",   "💰 Give balance to user"),
+        BotCommand("status",        "📊 System status"),
+    ]
     try:
-        from telegram import BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats
+        from telegram import (
+            BotCommandScopeAllPrivateChats,
+            BotCommandScopeAllGroupChats,
+            BotCommandScopeChat,
+        )
         await app.bot.set_my_commands(commands, scope=BotCommandScopeAllPrivateChats())
         await app.bot.set_my_commands(group_commands, scope=BotCommandScopeAllGroupChats())
-        logging.getLogger("startup").info("Bot commands set — private: %d, groups: %d",
-                                          len(commands), len(group_commands))
+        # Set admin commands for each admin individually
+        for admin_id in cfg.admin_ids:
+            try:
+                await app.bot.set_my_commands(
+                    commands + admin_commands,
+                    scope=BotCommandScopeChat(chat_id=admin_id)
+                )
+            except TelegramError:
+                pass
+        logging.getLogger("startup").info(
+            "Bot commands set — private: %d, groups: %d, admin: %d",
+            len(commands), len(group_commands), len(admin_commands))
     except TelegramError as exc:
         logging.getLogger("startup").warning("Could not set bot commands: %s", exc)
 

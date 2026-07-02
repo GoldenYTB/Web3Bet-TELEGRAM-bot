@@ -131,19 +131,29 @@ async def admin_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="admin:back")]]))
 
     elif data == "admin:games":
-        games = reg.all()
-        rows  = []
-        for g in games:
-            status = "✅" if g.enabled else "❌"
-            toggle = f"admin:toggle:{'off' if g.enabled else 'on'}:{g.key}"
-            label  = f"{status} {g.emoji} {g.name}"
-            if not g.toggleable:
-                label += " 🔒"
-                rows.append([InlineKeyboardButton(label, callback_data="admin:noop")])
-            else:
-                rows.append([InlineKeyboardButton(label, callback_data=toggle)])
+        games      = reg.all()
+        toggleable = [g for g in games if g.toggleable]
+        locked     = [g for g in games if not g.toggleable]
+        rows       = []
+        for i in range(0, len(toggleable), 2):
+            row = []
+            for g in toggleable[i:i+2]:
+                status = "✅" if g.enabled else "❌"
+                toggle = f"admin:toggle:{'off' if g.enabled else 'on'}:{g.key}"
+                row.append(InlineKeyboardButton(
+                    f"{status} {g.emoji} {g.name}", callback_data=toggle))
+            rows.append(row)
+        for g in locked:
+            rows.append([InlineKeyboardButton(
+                f"🔒 {g.emoji} {g.name} (Phase 2)", callback_data="admin:noop")])
         rows.append([InlineKeyboardButton("⬅️ Back", callback_data="admin:back")])
-        await edit(f"🎮 *Game Toggles*\n\nTap a game to toggle it:", InlineKeyboardMarkup(rows))
+        on_count  = sum(1 for g in games if g.enabled)
+        off_count = len(games) - on_count
+        await edit(
+            f"🎮 *Game Toggles*\n\n"
+            f"✅ {on_count} on  ❌ {off_count} off\n\n"
+            f"Tap any game to toggle on/off:",
+            InlineKeyboardMarkup(rows))
 
     elif data.startswith("admin:toggle:"):
         parts = data.split(":")
