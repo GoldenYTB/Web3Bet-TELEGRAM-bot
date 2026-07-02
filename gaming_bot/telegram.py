@@ -1436,12 +1436,52 @@ async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
 #  Handler registration
 # ══════════════════════════════════════════════════════════════════════════════
 
+async def reset_balance_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/resetbalance [username|all] — admin only."""
+    if not cfg.is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Admin only."); return
+
+    args = ctx.args
+    sto  = _store(ctx)
+
+    if not args:
+        await update.message.reply_text(
+            "Usage:\n"
+            "/resetbalance all — reset everyone\n"
+            "/resetbalance @username — reset one user"
+        ); return
+
+    target = args[0].lstrip("@").lower()
+
+    if target == "all":
+        count = 0
+        for u in sto.users.values():
+            u.usd_balance     = Decimal("0")
+            u.coin_holdings   = {}
+            count += 1
+        await update.message.reply_text(f"✅ Reset {count} user balances to $0.00")
+
+    else:
+        user = next((u for u in sto.users.values()
+                     if u.username.lower() == target or str(u.telegram_id) == target), None)
+        if not user:
+            await update.message.reply_text(f"❌ User @{target} not found."); return
+        old_bal          = user.usd_balance
+        user.usd_balance = Decimal("0")
+        user.coin_holdings = {}
+        await update.message.reply_text(
+            f"✅ Reset {user.display_name()} balance\n"
+            f"Was: ${old_bal:.2f} → Now: $0.00",
+            parse_mode="Markdown")
+
+
 def register_all_handlers(app: Application) -> None:
     # Commands
     app.add_handler(CommandHandler("start",  start))
     app.add_handler(CommandHandler("admin",  admin_command))
     app.add_handler(CommandHandler("status", status_command))
-    app.add_handler(CommandHandler("tip",    tip_command))
+    app.add_handler(CommandHandler("tip",          tip_command))
+    app.add_handler(CommandHandler("resetbalance", reset_balance_command))
     app.add_handler(CommandHandler("promo",  promo_command))
     app.add_handler(CommandHandler("dice",   dice_command))
     app.add_handler(CommandHandler("bowl",   bowl_command))
