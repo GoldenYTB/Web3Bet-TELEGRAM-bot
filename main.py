@@ -83,6 +83,7 @@ from gaming_bot.telegram import (
     stop_health_server,
 )
 from gaming_bot.wallet import WalletManager
+from gaming_bot import persistence
 from gaming_bot.blockchain import BlockchainMonitor
 from gaming_bot import swap as swap_module
 
@@ -133,6 +134,23 @@ async def _post_init(app: Application) -> None:
     # ── In-memory game store ──────────────────────────────────────────────────
     app.bot_data["store"]    = Store()
     app.bot_data["settings"] = cfg
+
+    # ── Load persisted data from Neon ─────────────────────────────────────────
+    if db_ok:
+        try:
+            await persistence.create_persistence_tables(engine)
+            loaded = await persistence.load_all_users(engine, app.bot_data["store"])
+            log.info("Loaded %d users from Neon database", loaded)
+        except Exception as exc:
+            log.warning("Could not load persisted data: %s", exc)
+
+        # Start background auto-flush every 60 seconds
+        flush_task = asyncio.create_task(
+            persistence.auto_flush_loop(engine, app.bot_data["store"], interval=60),
+            name="db-flush",
+        )
+        app.bot_data["flush_task"] = flush_task
+        log.info("Auto-flush started (every 60s)")
 
     # ── Wallet manager (EVM + Solana RPC connections) ─────────────────────────
     log.info("Connecting wallet manager…")
@@ -193,6 +211,22 @@ async def _post_shutdown(app: Application) -> None:
             await asyncio.wait_for(task, timeout=5)
         except (asyncio.CancelledError, asyncio.TimeoutError):
             pass
+
+    # Final flush before shutdown
+    engine = app.bot_data.get("db_engine")
+    store  = app.bot_data.get("store")
+    if engine and store:
+        try:
+            await persistence.flush_dirty(engine, store)
+            await persistence.save_house(engine, store)
+            log.info("Final DB flush complete")
+        except Exception as exc:
+            log.warning("Final flush failed: %s", exc)
+
+    # Cancel flush task
+    flush_task = app.bot_data.pop("flush_task", None)
+    if flush_task and not flush_task.done():
+        flush_task.cancel()
 
     # Stop blockchain monitor
     monitor: Optional[BlockchainMonitor] = app.bot_data.pop("monitor", None)
@@ -265,6 +299,15 @@ def _on_deposit(app: Application):
         from decimal import Decimal
         user.credit_usd(usd_value)
         user.add_coin_holding(event.coin_symbol, event.amount)
+        persistence.mark_dirty(event.user_id)
+
+        # Save immediately to DB
+        engine = app.bot_data.get("db_engine")
+        if engine:
+            try:
+                await persistence.save_user(engine, user)
+            except Exception as exc:
+                log.warning("Could not save user after deposit: %s", exc)
 
         log.info("Credited user %d +$%s USD (%s %s)",
                  event.user_id, usd_value, event.amount, event.coin_symbol)

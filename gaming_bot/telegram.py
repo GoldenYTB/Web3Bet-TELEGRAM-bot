@@ -592,6 +592,16 @@ async def _do_deposit(
             u.deposit_addresses[addr_key] = address
             u.deposit_keys[addr_key]      = enc_key
 
+            # Save wallet address to Neon immediately
+            engine = ctx.application.bot_data.get("db_engine")
+            if engine:
+                try:
+                    from .persistence import save_wallet, mark_dirty
+                    await save_wallet(engine, u.telegram_id, sym, network, address, enc_key)
+                    mark_dirty(u.telegram_id)
+                except Exception as exc:
+                    logger.warning("Could not save wallet to DB: %s", exc)
+
             # Register with blockchain monitor for automatic deposit detection
             monitor = ctx.application.bot_data.get("monitor")
             if monitor:
@@ -787,6 +797,16 @@ async def withdraw_confirmed(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
     if not u.debit_usd(amount):
         await _edit(update,"❌ Insufficient balance.",wallet_kb()); return ConversationHandler.END
 
+    # Save balance immediately after deduction
+    engine = ctx.application.bot_data.get("db_engine")
+    if engine:
+        from .persistence import save_user, mark_dirty
+        mark_dirty(u.telegram_id)
+        try:
+            await save_user(engine, u)
+        except Exception as exc:
+            logger.warning("Could not save user after withdrawal deduction: %s", exc)
+
     await _edit(update,
         f"⏳ *Processing withdrawal…*\n\n"
         f"Swapping ${amount:.2f} → {coin}\n"
@@ -894,6 +914,18 @@ async def tip_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Insufficient balance. You have ${sender.usd_balance:.2f}."); return
 
     target.credit_usd(amount)
+
+    # Persist both users after tip
+    engine = ctx.application.bot_data.get("db_engine")
+    if engine:
+        from .persistence import save_user, mark_dirty
+        for tu in (sender, target):
+            mark_dirty(tu.telegram_id)
+            try:
+                await save_user(engine, tu)
+            except Exception as exc:
+                logger.warning("Could not save user after tip: %s", exc)
+
     await update.message.reply_text(f"💝 *Tipped ${amount:.2f} to @{target.username}!*",
                                     parse_mode=ParseMode.MARKDOWN)
     try:
@@ -1170,6 +1202,22 @@ async def dice_message_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await ctx.bot.send_message(game.chat_id, result_text(game),
                                    parse_mode=ParseMode.MARKDOWN)
 
+        # Persist balances after game
+        engine = ctx.application.bot_data.get("db_engine")
+        if engine:
+            from .persistence import save_user, save_house, mark_dirty
+            for user_obj in (p1, p2):
+                if user_obj:
+                    mark_dirty(user_obj.telegram_id)
+                    try:
+                        await save_user(engine, user_obj)
+                    except Exception as exc:
+                        logger.warning("Could not save user after game: %s", exc)
+            try:
+                await save_house(engine, sto)
+            except Exception as exc:
+                logger.warning("Could not save house after game: %s", exc)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Admin panel
@@ -1436,6 +1484,88 @@ async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
 #  Handler registration
 # ══════════════════════════════════════════════════════════════════════════════
 
+async def admin_help_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not cfg.is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Admin only."); return
+    lines = [
+        "⚙️ *Admin Command Reference*",
+        "",
+        "*Balance & Users*",
+        "`/resetbalance all` — reset everyone to $0",
+        "`/resetbalance @user` — reset one user",
+        "`/givebalance @user amount` — give USD to user",
+        "",
+        "*Games*",
+        "`/toggle_game [game] on/off` — toggle game",
+        "`/list_games` — see all games + status",
+        "",
+        "*Game names:* dice, bowling, darts,",
+        "coinflip, rps, roulette, blackjack,",
+        "baccarat, keno, crash, plinko,",
+        "mines, limbo, tower",
+        "",
+        "*House Fund*",
+        "`/admin` → 📊 Stats — view house balance",
+        "`/admin` → 💸 Withdraw house funds",
+        "",
+        "*Socials*",
+        "`/admin` → 🔗 Social links",
+        "Reply: `twitter https://...`",
+        "Platforms: channel, chat, twitter,",
+        "tiktok, youtube, discord",
+        "",
+        "*Promo Codes*",
+        "`/admin` → 🎟 Add promo",
+        "Reply: `CODE amount uses`",
+        "Example: `SUMMER10 10.00 50`",
+        "",
+        "*Referral Bonus*",
+        "`/admin` → 👥 Referral bonus → reply amount",
+        "",
+        "*Tip Limits*",
+        "`/admin` → 💝 Tip limits → reply: `min max`",
+        "",
+        "*Bot Betting*",
+        "`/admin` → 🤖 Bot betting — toggle on/off",
+        "",
+        "`/adminhelp` — show this list",
+    ]
+    await update.message.reply_text(
+        "\n".join(lines), parse_mode="Markdown")
+
+
+async def give_balance_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/givebalance @username amount"""
+    if not cfg.is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Admin only."); return
+    args = ctx.args
+    if len(args) < 2:
+        await update.message.reply_text("Usage: /givebalance @username amount"); return
+    target_name = args[0].lstrip("@").lower()
+    try:
+        amount = Decimal(args[1])
+    except Exception:
+        await update.message.reply_text("❌ Invalid amount."); return
+    sto  = _store(ctx)
+    user = next((u for u in sto.users.values()
+                 if u.username.lower() == target_name or str(u.telegram_id) == target_name), None)
+    if not user:
+        await update.message.reply_text(f"❌ User @{target_name} not found."); return
+    user.credit_usd(amount)
+    engine = ctx.application.bot_data.get("db_engine")
+    if engine:
+        from .persistence import save_user, mark_dirty
+        mark_dirty(user.telegram_id)
+        try:
+            await save_user(engine, user)
+        except Exception: pass
+    msg = (
+        "\u2705 Gave *$" + f"{amount:.2f}" + "* to " + user.display_name() + "\n"
+        "New balance: *$" + f"{user.usd_balance:.2f}" + "*"
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
 async def reset_balance_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/resetbalance [username|all] — admin only."""
     if not cfg.is_admin(update.effective_user.id):
@@ -1482,6 +1612,8 @@ def register_all_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("tip",          tip_command))
     app.add_handler(CommandHandler("resetbalance", reset_balance_command))
+    app.add_handler(CommandHandler("givebalance",  give_balance_command))
+    app.add_handler(CommandHandler("adminhelp",    admin_help_command))
     app.add_handler(CommandHandler("promo",  promo_command))
     app.add_handler(CommandHandler("dice",   dice_command))
     app.add_handler(CommandHandler("bowl",   bowl_command))
